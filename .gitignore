@@ -68,7 +68,9 @@ models/*/weights/
 # Experiment tracking
 wandb/
 mlruns/
-tensorboard_logs/
+tensorboard/
+logs/
+log/
 lightning_logs/
 
 
