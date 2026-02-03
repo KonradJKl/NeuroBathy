@@ -111,32 +111,33 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, savedir=None,
         rays_od = torch.cat([rays_o.unsqueeze(0), rays_d.unsqueeze(0)], dim=0)
         rays_od = rays_od.permute([1, 2, 0, 3])
         rays_od = rays_od[:, :, None, :, :]
-        rays_od = torch.repeat_interleave(rays_od, 9, dim=2)
-        # Try to pre-arrange neighbor rays for normal calculation later(code could be polished)
-        for h in range(len(rays_od)):
-            for w in range(len(rays_od[0])):
-                h_ind = np.array([-1, 0, 1])
-                w_ind = np.array([-1, 0, 1])
-                gaph = gapw = 0
-                if h < 1:
-                    gaph = 1
-                if h >= (len(rays_od) - 1):
-                    gaph = -1
-                if w < 1:
-                    gapw = 1
-                if w >= (len(rays_od[0]) - 1):
-                    gapw = -1
 
-                h_ind += gaph
-                w_ind += gapw
-                listnear = []
-                for i in range(len(h_ind)):
-                    for j in range(len(w_ind)):
-                        listnear.append([h_ind[i], w_ind[j]])
-                listnear.remove([0, 0])
+        # Vectorized neighbor gathering
+        # Reminder: rays_od shape: [H, W, 1, 2, 3]
+        H_img, W_img = rays_od.shape[0], rays_od.shape[1]
 
-                for num in range(8):
-                    rays_od[h][w][num + 1] = rays_od[h + listnear[num][0]][w + listnear[num][1]][0]
+        # Squeeze to [H, W, 2, 3] and rearrange to [2, 3, H, W] for padding
+        rays_squeezed = rays_od.squeeze(2)
+        rays_permuted = rays_squeezed.permute(2, 3, 0, 1)
+
+        # Pad with replicate mode
+        rays_padded = F.pad(rays_permuted, (1, 1, 1, 1), mode="replicate")  # [2, 3, H+2, W+2]
+        rays_padded = rays_padded.permute(2, 3, 0, 1)  # [H+2, W+2, 2, 3]
+
+        # Gather center + 8 neighbors using vectorized slicing with original order
+        neighbors = [
+            rays_squeezed,  # Center
+            rays_padded[0:H_img, 0:W_img, :, :],  # top-left
+            rays_padded[0:H_img, 1:W_img + 1, :, :],  # top
+            rays_padded[0:H_img, 2:W_img + 2, :, :],  # top-right
+            rays_padded[1:H_img + 1, 0:W_img, :, :],  # left
+            rays_padded[1:H_img + 1, 2:W_img + 2, :, :],  # right
+            rays_padded[2:H_img + 2, 0:W_img, :, :],  # bottom-left
+            rays_padded[2:H_img + 2, 1:W_img + 1, :, :],  # bottom
+            rays_padded[2:H_img + 2, 2:W_img + 2, :, :],  # bottom-right
+        ]
+
+        rays_od = torch.stack(neighbors, dim=2) # [H, W, 9, 2, 3]
 
         rays_od = rays_od.view([-1, 2, 3])
         rays_o, rays_d = torch.split(rays_od, [1, 1], dim=-2)
@@ -619,6 +620,11 @@ def config_parser():
 def train():
     
     set_seed(0)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")  # TF32 for Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     parser = config_parser()
     args = parser.parse_args()
     args.expname = args.expname + '_' + args.nerf_type + '_d' + str(args.initdepth)\
@@ -758,6 +764,8 @@ def train():
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    if hasattr(torch, "compile"):
+        render_kwargs_train["network_fn"] = torch.compile(render_kwargs_train["network_fn"], mode="reduce-overhead")
     global_step = start
 
     bds_dict = {
@@ -870,9 +878,9 @@ def train():
         i_batch = 0
         
     # Move training data to GPU
-    images = torch.Tensor(images).to(device)
-    rays_rgb = torch.Tensor(rays_rgb).to(device)
-    poses = torch.Tensor(poses).to(device)
+    images = torch.Tensor(images).pin_memory().to(device, non_blocking=True)
+    rays_rgb = torch.Tensor(rays_rgb).pin_memory().to(device, non_blocking=True)
+    poses = torch.Tensor(poses).pin_memory().to(device, non_blocking=True)
 
     N_iters = args.N_iter + 1
     print('Begin')
@@ -956,7 +964,7 @@ def train():
                                                   verbose=i < 10, retraw=True,
                                                   **render_kwargs_train)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         target_s = target_s.view([-1, 9, 3])
         target_s = target_s[:, 0, :].squeeze()

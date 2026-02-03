@@ -96,7 +96,8 @@ class LeastSquares:
         
         # QR decomposition
         q, r = torch.linalg.qr(A, mode='reduced')
-        w = torch.inverse(r) @ q.transpose(1, 2) @ Y
+        #w = torch.inverse(r) @ q.transpose(1, 2) @ Y
+        w = torch.linalg.solve_triangular(r, q.transpose(1, 2) @ Y, upper=True)
 
         return w
 
@@ -130,9 +131,9 @@ class NeRFrac(nn.Module):
         self.embeddirs_fn = embeddirs_fn
         
         self.yita = modelargs.yita
-        self.Himg = modelargs.H
-        self.Wimg = modelargs.W
-        self.f = modelargs.f
+        self.register_buffer('Himg', torch.tensor(float(modelargs.H)))
+        self.register_buffer('Wimg', torch.tensor(float(modelargs.W)))
+        self.register_buffer('f', torch.tensor(float(modelargs.f)))
         self.initdepth = modelargs.initdepth
         
         self.i_embed = modelargs.i_embed
