@@ -32,9 +32,8 @@ TINY_NUMBER = 1e-6      # float32 only has 7 decimal digits precision
 img_HWC2CHW = lambda x: x.permute(2, 0, 1)
 gray2rgb = lambda x: x.unsqueeze(2).repeat(1, 1, 3)
 
-
 to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-mse2psnr = lambda x: -10. * np.log(x+TINY_NUMBER) / np.log(10.)
+mse2psnr = lambda x: -10. * np.log(x + TINY_NUMBER) / np.log(10.)
 
 
 def save_current_code(outdir):
@@ -227,6 +226,7 @@ def psnr_1(img1, img2):
         return 100
     psnr_1 = 20 * math.log10(255 / math.sqrt(mse))
     return psnr_1
+
 
 """
 def ssim(img1, img2):
