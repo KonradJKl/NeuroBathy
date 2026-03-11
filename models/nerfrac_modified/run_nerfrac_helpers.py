@@ -294,7 +294,7 @@ class NeRFrac(nn.Module):
 
         ls = LeastSquares()
         w = ls.lstq(pts_xy, pts_z, 0.010)
-        w = w.squeeze()
+        w = w.squeeze(-1)
         w1, w2 = torch.split(w, [1, 1], dim=-1)
         norm_near = torch.cat([-w1, -w2, torch.ones_like(w1)], dim=-1)
         norm_near = norm_near / torch.norm(norm_near, dim=-1, keepdim=True)
@@ -463,9 +463,9 @@ class NeRFrac(nn.Module):
         norm_real = self.get_norm(Xs_real)
 
         input_views_ndc = input_views_ndc.view([-1, 9, 3])
-        input_views_ndc = input_views_ndc[:, 0, :].squeeze()
+        input_views_ndc = input_views_ndc[:, 0, :]
         Xs_ndc = Xs_ndc.view([-1, 9, 3])
-        Xs_ndc = Xs_ndc[:, 0, :].squeeze()
+        Xs_ndc = Xs_ndc[:, 0, :]
 
         input_view_real = self.ndc2cam(
             input_views_ndc, Xs_ndc, self.Wimg, self.Himg, self.f
