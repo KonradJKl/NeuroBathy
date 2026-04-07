@@ -470,7 +470,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
                 (mask_i.reshape(-1) > 0.5).astype(np.float32), device=c2w.device
             )
 
-        rgb, disp, acc, Xs, depth_map, sample_ray, _ = render(
+        rgb, disp, acc, Xs, depth_map, sample_ray, extras = render(
             H,
             W,
             K,
@@ -480,10 +480,19 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             pixel_water_mask=pwm,
             **render_kwargs,
         )
+        depth_mode = extras["depth_mode"]
         if savedir is not None:
             np.save(
                 os.path.join(savedir, f"{args.expname}{i:03d}_depth.npy"),
                 depth_map.cpu().numpy().reshape(H, W).astype("float32"),
+            )
+            np.save(
+                os.path.join(savedir, f"{args.expname}{i:03d}_acc.npy"),
+                acc.cpu().numpy().reshape(H, W).astype("float32"),
+            )
+            np.save(
+                os.path.join(savedir, f"{args.expname}{i:03d}_depth_mode.npy"),
+                depth_mode.cpu().numpy().reshape(H, W).astype("float32"),
             )
         rgb = torch.reshape(rgb, [H, W, 3])
         rgbs.append(rgb.cpu().numpy())
@@ -760,6 +769,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
     depth_map = torch.sum(weights * z_vals, -1)
+    depth_mode = z_vals[torch.arange(len(weights)), torch.argmax(weights, dim=-1)]
     disp_map = 1.0 / torch.max(
         1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1)
     )
@@ -768,8 +778,19 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     if white_bkgd:
         rgb_map = rgb_map + (1.0 - acc_map[..., None])
 
-    return rgb_map, disp_map, acc_map, weights, depth_map
+    return rgb_map, disp_map, acc_map, weights, depth_map, depth_mode
 
+def distortion_loss(weights, z_vals):
+    t_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+    delta = z_vals[..., 1:] - z_vals[..., :-1]
+    w = weights[..., :-1]  # (N_rays, N_samples-1)
+    w_cumsum = torch.cumsum(w, dim=-1)       # (N_rays, N_samples-1)
+    wt_cumsum = torch.cumsum(w * t_mid, dim=-1)
+    loss_uni = 2.0 * torch.sum(
+        w * t_mid * w_cumsum - w * wt_cumsum, dim=-1
+    )
+    loss_bi = (1.0 / 3.0) * torch.sum(w ** 2 * delta, dim=-1)
+    return torch.mean(loss_uni + loss_bi)
 
 def render_rays(
     ray_batch,
@@ -807,7 +828,7 @@ def render_rays(
     raw, Xs, z_vals, sample_ray, dD = network_query_fn(
         rays_o, viewdirs, wm, network_fn, N_samples, N_importance
     )
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
+    rgb_map, disp_map, acc_map, weights, depth_map, depth_mode = raw2outputs(
         raw, z_vals, sample_ray, raw_noise_std, white_bkgd, pytest=pytest
     )
 
@@ -820,9 +841,12 @@ def render_rays(
         "dD": dD,
     }
     ret["depth_map"] = depth_map
+    ret["depth_mode"] = depth_mode  # NEW
     ret["water_mask"] = wm
     if retraw:
         ret["raw"] = raw
+    ret["weights"] = weights
+    ret["z_vals"] = z_vals
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
@@ -832,7 +856,6 @@ def render_rays(
 
 
 def config_parser():
-
     import configargparse
 
     parser = configargparse.ArgumentParser()
@@ -1147,12 +1170,36 @@ def config_parser():
         default=256,
         help="number of water pixels to sample per view for consistency loss",
     )
+    # --- Distortion loss (Mip-NeRF 360) ---
+    parser.add_argument(
+        "--distortion_weight",
+        type=float,
+        default=0.0,
+        help="weight for distortion loss (0 to disable). Try 0.01-0.1",
+    )
+    parser.add_argument(
+        "--distortion_warmup",
+        type=int,
+        default=10000,
+        help="iterations to linearly ramp distortion loss from 0",
+    )
+    parser.add_argument(
+        "--flatness_weight",
+        type=float,
+        default=0.0,
+        help="weight for water surface flatness loss (0 to disable). Penalizes variance of Xs Z across water rays in each batch.",
+    )
+    parser.add_argument(
+        "--flatness_warmup",
+        type=int,
+        default=10000,
+        help="iterations to linearly ramp flatness loss from 0",
+    )
 
     return parser
 
 
 def train():
-    
     set_seed(0)
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")  # TF32 for Ampere+ GPUs
@@ -1663,6 +1710,37 @@ def train():
 
         loss = img_loss + effective_smooth_weight * smooth_loss
 
+        # Flatness loss
+        flat_loss = torch.tensor(0.0, device=device)
+        effective_flat_weight = 0.0
+        if args.flatness_weight > 0 and Xs is not None:
+            wm_out = extras.get("water_mask", None)
+            if wm_out is not None:
+                water_mask = wm_out > 0.5
+                if water_mask.sum() > 1:
+                    Xs_water_z = Xs[water_mask, 2]
+                    flat_loss = torch.var(Xs_water_z)
+            elif Xs.shape[0] > 1:
+                flat_loss = torch.var(Xs[:, 2])
+            if args.flatness_warmup > 0 and global_step < args.flatness_warmup:
+                effective_flat_weight = args.flatness_weight * (global_step / args.flatness_warmup)
+            else:
+                effective_flat_weight = args.flatness_weight
+            loss = loss + effective_flat_weight * flat_loss
+
+        # Distortion loss (Mip-NeRF 360)
+        dist_loss = torch.tensor(0.0, device=device)
+        effective_dist_weight = 0.0
+        if args.distortion_weight > 0:
+            if global_step < args.distortion_warmup:
+                effective_dist_weight = args.distortion_weight * (
+                        global_step / args.distortion_warmup
+                )
+            else:
+                effective_dist_weight = args.distortion_weight
+            dist_loss = distortion_loss(extras["weights"], extras["z_vals"])
+            loss = loss + effective_dist_weight * dist_loss
+
         psnr = mse2psnr(img_loss)
 
         # Coarse network loss
@@ -1729,6 +1807,16 @@ def train():
                 effective_consist_weight,
                 global_step=i,
             )
+        if args.distortion_weight > 0:
+            writer.add_scalar("loss/distortion", dist_loss.item(), global_step=i)
+            writer.add_scalar(
+                "distortion/effective_weight",
+                effective_dist_weight,
+                global_step=i,
+            )
+        if args.flatness_weight > 0:
+            writer.add_scalar("loss/flatness", flat_loss.item(), global_step=i)
+            writer.add_scalar("flatness/effective_weight", effective_flat_weight, global_step=i)
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(
