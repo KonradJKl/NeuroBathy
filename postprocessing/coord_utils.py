@@ -3,12 +3,10 @@ Shared coordinate transform and I/O utilities for the post-processing pipeline.
 
 """
 
-import collections
 import glob
 import json
 import os
 import sqlite3
-import struct
 
 import numpy as np
 import rasterio
@@ -17,125 +15,11 @@ from PIL.ExifTags import GPSTAGS, TAGS
 from pyproj import Transformer
 from scipy import stats as sp_stats
 
+from colmap_io import qvec2rotmat, read_colmap_images_binary
+
 
 WATER_MASK_THRESHOLD = 127  # uint8 mask: pixel > threshold = water
 NEAR = 1.0  # NDC near plane distance
-
-
-
-_ColmapImage = collections.namedtuple(
-    "ColmapImage", ["id", "qvec", "tvec", "camera_id", "name"]
-)
-
-_ColmapCamera = collections.namedtuple(
-    "ColmapCamera", ["id", "model", "width", "height", "params"]
-)
-
-_CAMERA_MODEL_NUM_PARAMS = {
-    0: 3,
-    1: 4,
-    2: 4,
-    3: 5,
-    4: 8,
-    5: 8,
-    6: 12,
-    7: 5,
-    8: 4,
-    9: 5,
-    10: 12,
-}
-
-_CAMERA_MODEL_NAMES = {
-    0: "SIMPLE_PINHOLE",
-    1: "PINHOLE",
-    2: "SIMPLE_RADIAL",
-    3: "RADIAL",
-    4: "OPENCV",
-    5: "OPENCV_FISHEYE",
-    6: "FULL_OPENCV",
-    7: "FOV",
-    8: "SIMPLE_RADIAL_FISHEYE",
-    9: "RADIAL_FISHEYE",
-    10: "THIN_PRISM_FISHEYE",
-}
-
-
-def _read_next_bytes(fid, num_bytes, fmt, endian="<"):
-    data = fid.read(num_bytes)
-    return struct.unpack(endian + fmt, data)
-
-
-def read_colmap_images_binary(path):
-    images = {}
-    with open(path, "rb") as fid:
-        num_images = _read_next_bytes(fid, 8, "Q")[0]
-        for _ in range(num_images):
-            props = _read_next_bytes(fid, 64, "idddddddi")
-            image_id = props[0]
-            qvec = np.array(props[1:5])
-            tvec = np.array(props[5:8])
-            camera_id = props[8]
-            # Read null-terminated name
-            name = ""
-            ch = _read_next_bytes(fid, 1, "c")[0]
-            while ch != b"\x00":
-                name += ch.decode("utf-8")
-                ch = _read_next_bytes(fid, 1, "c")[0]
-            # Skip 2D points
-            num_points2D = _read_next_bytes(fid, 8, "Q")[0]
-            _read_next_bytes(fid, 24 * num_points2D, "ddq" * num_points2D)
-            images[image_id] = _ColmapImage(
-                id=image_id,
-                qvec=qvec,
-                tvec=tvec,
-                camera_id=camera_id,
-                name=name,
-            )
-    return images
-
-
-def read_colmap_cameras_binary(path):
-    cameras = {}
-    with open(path, "rb") as fid:
-        num_cameras = _read_next_bytes(fid, 8, "Q")[0]
-        for _ in range(num_cameras):
-            props = _read_next_bytes(fid, 24, "iiQQ")
-            camera_id = props[0]
-            model_id = props[1]
-            width = props[2]
-            height = props[3]
-            num_params = _CAMERA_MODEL_NUM_PARAMS[model_id]
-            params = np.array(_read_next_bytes(fid, 8 * num_params, "d" * num_params))
-            cameras[camera_id] = _ColmapCamera(
-                id=camera_id,
-                model=_CAMERA_MODEL_NAMES.get(model_id, f"UNKNOWN_{model_id}"),
-                width=width,
-                height=height,
-                params=params,
-            )
-    return cameras
-
-
-def qvec2rotmat(qvec):
-    return np.array(
-        [
-            [
-                1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
-                2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
-                2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
-            ],
-            [
-                2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
-                1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
-                2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
-            ],
-            [
-                2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
-                2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
-                1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
-            ],
-        ]
-    )
 
 
 def extract_colmap_camera_centers(sparse_dir):
