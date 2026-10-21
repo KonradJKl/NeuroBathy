@@ -1,305 +1,290 @@
-import os
-import torch
-import numpy as np
-import cv2
-from glob import glob
-from PIL import Image
-from tqdm import tqdm
-from scipy import ndimage
+"""
+Generate binary water masks with SAM3 text prompts.
+
+Usage examples:
+    # Pielach (river)
+    python sam3_mask_generator/masking_merge.py \\
+        --input_dir data/model_formatted/nerfrac/pielach_data/images_8 \\
+        --output_dir data/model_formatted/nerfrac/pielach_data/masks_8 \\
+        --scene river
+
+    # Coastal scene with seagrass
+    python sam3_mask_generator/masking_merge.py \\
+        --input_dir /path/to/coast/images_4 \\
+        --output_dir /path/to/coast/masks_4 \\
+        --scene coastal \\
+        --hsv_recovery
+"""
+
+import argparse
 import gc
+import glob
+import os
+import sys
+import traceback
 
-from sam3.model_builder import build_sam3_image_model
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from scipy import ndimage
+from tqdm import tqdm
+
 from sam3.model.sam3_image_processor import Sam3Processor
+from sam3.model_builder import build_sam3_image_model
 
-#INPUT_DIR = "/path/to/images_4/"
-#OUTPUT_DIR = "/path/to/masks_4_opt_off/"
-INPUT_DIR = "/path/to/images/"
-OUTPUT_DIR = "/path/to/masks/"
-MAX_IMAGE_SIZE = 4096
+# scene: (primary prompts, fallback prompts)
+PROMPTS = {
+    "river": (["river"], ["dark river", "stream", "creek", "flowing river"]),
+    "coastal": (["ocean", "sea", "shallow water"], ["coastal water", "clear water"]),
+}
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
-# --- HSV Water Recovery Settings ---
-# After SAM3 segmentation, recover water pixels that were missed (e.g. seagrass areas that SAM3 classifies as land despite being submerged).
-# Stage 1: Region-grow from SAM3 seed into hue-matching pixels.
-# Stage 2: Fill enclosed holes in the water mask.
-# Stage 3: Morphological closing to smooth edges.
-HSV_RECOVERY_ENABLED = False
-HSV_MIN_SATURATION = 30  # minimum saturation to be considered "colored" (not gray)
-HSV_MIN_WATER_PCT = 5.0  # only apply recovery if SAM3 detected at least this % water
-HSV_GROW_KERNEL_SIZE = 5  # region-grow dilation kernel size (pixels)
-HSV_GROW_MAX_ITERS = 50  # max region-grow iterations (converges much earlier)
-HSV_HOLE_FILL_ENABLED = True  # fill enclosed non-water regions (brown seagrass)
-HSV_HOLE_MIN_SAT_RATIO = 0.3  # hole sat threshold = max(20, ratio * water_sat_median)
-HSV_MORPH_CLOSE_KERNEL = 15  # morphological closing kernel size (0 to disable)
+HSV_MIN_SATURATION = 30  # below this a pixel counts as gray, not colored
+HSV_MIN_WATER_PCT = 5.0  # skip recovery if SAM3 found less water than this
+HSV_GROW_KERNEL_SIZE = 5
+HSV_GROW_MAX_ITERS = 50
+HSV_HOLE_MIN_SAT_RATIO = 0.3  # holes need saturation > max(20, ratio * water median)
+HSV_CLOSE_KERNEL_SIZE = 15
 
 
-def hsv_recover_water(image_bgr, binary_mask):
-    """Recovers water pixels missed by SAM3 using HSV-guided region growing and hole filling.
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate binary water masks with SAM3 text prompts."
+    )
 
-    Three-stage recovery:
-      1. Region-grow from SAM3 seed into adjacent hue-matching pixels. Uses an
-         adaptive IQR-based hue range learned from the seed. Because growth is
-         connectivity-constrained, disconnected features (streets, buildings)
-         cannot be reached.
-      2. Fill enclosed holes: non-water regions completely surrounded by water
-         are likely submerged features (brown seagrass, dark water). A saturation
-         filter rejects concrete/asphalt holes.
-      3. Morphological closing to smooth edges and fill small gaps.
+    # Data
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Directory with the .jpg/.png images (e.g. pielach_data/images_8)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Output directory for the full-size masks, saved as <image stem>.png "
+        "with 255 = water (e.g. pielach_data/masks_8)",
+    )
 
-    :param image_bgr: Original image in BGR format (numpy array, H x W x 3).
-    :param binary_mask: SAM3 binary mask (numpy uint8, H x W, 255=water 0=land).
-    :return: Tuple of (recovered_mask, n_recovered) where recovered_mask is the
-             expanded binary mask and n_recovered is the number of pixels added.
+    # Segmentation
+    parser.add_argument(
+        "--scene",
+        type=str,
+        required=True,
+        choices=sorted(PROMPTS),
+        help="Prompt set from PROMPTS: 'river' (e.g. Pielach) or 'coastal' "
+        "(e.g. Santa Maria)",
+    )
+    parser.add_argument(
+        "--primary_conf",
+        type=float,
+        default=0.5,
+        help="Confidence threshold of the primary prompts (default: 0.5)",
+    )
+    parser.add_argument(
+        "--fallback_conf",
+        type=float,
+        default=0.3,
+        help="Confidence threshold of the fallback prompts (default: 0.3)",
+    )
+    parser.add_argument(
+        "--max_image_size",
+        type=int,
+        default=768,
+        help="Downscale images to this longest side in pixels before SAM3 "
+        "(default: 768)",
+    )
+
+    # HSV recovery
+    parser.add_argument(
+        "--hsv_recovery",
+        action="store_true",
+        help="Grow the mask into hue-matching pixels and fill enclosed holes "
+        "(seagrass, mixed sediment)",
+    )
+    return parser.parse_args()
+
+
+def hsv_recover_water(image_rgb, binary_mask):
+    """Add water pixels SAM3 missed by hue-guided region growing and hole filling.
+
+    Growth only follows connected pixels, so water-colored streets or roofs that
+    don't touch the water are not reached. Holes touching the image border are
+    filled only if their hue is in the water range.
+
+    :return: (mask, n_recovered), mask uint8 with 255 = water
     """
-    h, w = binary_mask.shape
-    total_pixels = h * w
+    H, W = binary_mask.shape
     seed = binary_mask > 127
-    seed_count = int(seed.sum())
-    water_pct = seed_count / total_pixels * 100
-
-    if water_pct < HSV_MIN_WATER_PCT:
+    n_seed = int(seed.sum())
+    if n_seed / (H * W) * 100 < HSV_MIN_WATER_PCT:
         return binary_mask, 0
 
-    img_hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    img_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
 
-    # --- Stage 1: Region-grow from SAM3 seed into hue-matching pixels ---
+    # region growing into pixels with the water hue
     water_hues = img_hsv[seed, 0]
     median_hue = np.median(water_hues)
-    q25 = np.percentile(water_hues, 25)
-    q75 = np.percentile(water_hues, 75)
-    iqr = q75 - q25
-
-    half_range = max(10, min(30, 1.5 * iqr))
+    q25, q75 = np.percentile(water_hues, [25, 75])
+    half_range = max(10, min(30, 1.5 * (q75 - q25)))
     hue_min = max(0, int(median_hue - half_range))
     hue_max = min(179, int(median_hue + half_range))
-
     candidate = (
         (img_hsv[:, :, 0] >= hue_min)
         & (img_hsv[:, :, 0] <= hue_max)
         & (img_hsv[:, :, 1] > HSV_MIN_SATURATION)
-    )
+    ).astype(np.uint8)
 
-    grow_kernel = cv2.getStructuringElement(
+    kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (HSV_GROW_KERNEL_SIZE, HSV_GROW_KERNEL_SIZE)
     )
     current = seed.astype(np.uint8)
-    candidate_uint8 = candidate.astype(np.uint8)
     for _ in range(HSV_GROW_MAX_ITERS):
-        dilated = cv2.dilate(current, grow_kernel, iterations=1)
-        new_mask = dilated & candidate_uint8
-        new_mask = new_mask | current
-        if np.array_equal(new_mask, current):
+        grown = (cv2.dilate(current, kernel) & candidate) | current
+        if np.array_equal(grown, current):
             break
-        current = new_mask
+        current = grown
     grown = current > 0
 
-    # --- Stage 2: Fill enclosed holes (catches brown seagrass) ---
-    if HSV_HOLE_FILL_ENABLED:
-        land = ~grown
-        labeled_land, n_components = ndimage.label(land.astype(np.uint8))
+    # fill enclosed holes, e.g. submerged seagrass
+    labeled_land, n_components = ndimage.label(~grown)
+    border = np.zeros((H, W), dtype=bool)
+    border[[0, -1], :] = True
+    border[:, [0, -1]] = True
+    sat_thresh = max(20, HSV_HOLE_MIN_SAT_RATIO * np.median(img_hsv[grown, 1]))
+    for comp_id in range(1, n_components + 1):
+        comp = labeled_land == comp_id
+        if img_hsv[comp, 1].mean() <= sat_thresh:
+            continue
+        on_border = (comp & border).any()
+        if not on_border or hue_min <= np.median(img_hsv[comp, 0]) <= hue_max:
+            grown[comp] = True
 
-        border = np.zeros((h, w), dtype=bool)
-        border[0, :] = True
-        border[-1, :] = True
-        border[:, 0] = True
-        border[:, -1] = True
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (HSV_CLOSE_KERNEL_SIZE, HSV_CLOSE_KERNEL_SIZE)
+    )
+    closed = cv2.morphologyEx(grown.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    return closed * 255, int(closed.sum()) - n_seed
 
-        water_sat_median = np.median(img_hsv[grown, 1]) if grown.sum() > 0 else 50
-        sat_thresh = max(20, HSV_HOLE_MIN_SAT_RATIO * water_sat_median)
 
-        for comp_id in range(1, n_components + 1):
-            comp = labeled_land == comp_id
-            comp_sat = img_hsv[comp, 1].mean()
-            touches_border = (comp & border).any()
+def resize_image(image, max_size):
+    W, H = image.size
+    if max(W, H) <= max_size:
+        return image
+    scale = max_size / max(W, H)
+    return image.resize((int(W * scale), int(H * scale)), Image.LANCZOS)
 
-            if not touches_border:
-                if comp_sat > sat_thresh:
-                    grown[comp] = True
-            else:
-                comp_hue_median = np.median(img_hsv[comp, 0])
-                if hue_min <= comp_hue_median <= hue_max and comp_sat > sat_thresh:
-                    grown[comp] = True
 
-    # --- Stage 3: Morphological closing ---
-    if HSV_MORPH_CLOSE_KERNEL > 0:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (HSV_MORPH_CLOSE_KERNEL, HSV_MORPH_CLOSE_KERNEL)
+def segment(processor, image, prompts, primary_conf, fallback_conf):
+    """Masks of all primary prompts, or of the first fallback prompt that finds water.
+
+    :return: (masks, fallback prompt or None), empty list if no prompt found water
+    """
+    primary_prompts, fallback_prompts = prompts
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        state = processor.set_image(image)
+
+        processor.set_confidence_threshold(primary_conf)
+        masks = []
+        for prompt in primary_prompts:
+            masks.extend(processor.set_text_prompt(state=state, prompt=prompt)["masks"])
+        if masks:
+            return masks, None
+
+        processor.set_confidence_threshold(fallback_conf)
+        for prompt in fallback_prompts:
+            masks = processor.set_text_prompt(state=state, prompt=prompt)["masks"]
+            if len(masks) > 0:
+                return list(masks), prompt
+    return [], None
+
+
+def union_masks(masks, H, W):
+    """Merge SAM3 masks into one uint8 mask at the full image size, 255 = water."""
+    binary_mask = np.zeros((H, W), dtype=np.uint8)
+    for mask in masks:
+        # SAM3 returns masks at the resized image size
+        mask = cv2.resize(
+            mask[0].cpu().numpy().astype(np.float32),
+            (W, H),
+            interpolation=cv2.INTER_LINEAR,
         )
-        grown = cv2.morphologyEx(
-            grown.astype(np.uint8), cv2.MORPH_CLOSE, kernel
-        ).astype(bool)
-
-    recovered_mask = grown.astype(np.uint8) * 255
-    n_recovered = int(grown.sum()) - seed_count
-    return recovered_mask, n_recovered
+        binary_mask[mask > 0.5] = 255
+    return binary_mask
 
 
-def resize_image(image_pil, max_size):
-    """Resize image"""
-    w, h = image_pil.size
-    if max(w, h) > max_size:
-        scale = max_size / max(w, h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        return image_pil.resize((new_w, new_h), Image.LANCZOS), (w, h)
-    return image_pil, (w, h)
+def main():
+    args = parse_args()
 
-
-def try_prompts_with_merging(
-    processor,
-    image_resized,
-    primary_prompts,
-    fallback_prompts,
-    primary_conf,
-    fallback_conf,
-):
-
-    with torch.inference_mode():
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            inference_state = processor.set_image(image_resized)
-
-    all_masks = []
-
-    if isinstance(primary_prompts, str):
-        primary_prompts = [primary_prompts]
-
-    processor.confidence_threshold = primary_conf
-
-    for prompt in primary_prompts:
-        with torch.inference_mode():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = processor.set_text_prompt(state=inference_state, prompt=prompt)
-
-        masks = output["masks"]
-        if masks is not None and len(masks) > 0:
-            all_masks.extend(masks)
-
-    if len(all_masks) > 0:
-        return all_masks, str(primary_prompts), primary_conf
-
-    processor.confidence_threshold = fallback_conf
-
-    for prompt in fallback_prompts:
-        torch.cuda.empty_cache()
-
-        with torch.inference_mode():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = processor.set_text_prompt(state=inference_state, prompt=prompt)
-
-        masks = output["masks"]
-        if masks is not None and len(masks) > 0:
-            return masks, prompt, fallback_conf
-
-    return None, None, None
-
-
-def generate_masks():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    image_paths = sorted(glob(os.path.join(INPUT_DIR, "*")))
-    image_paths = [
-        p for p in image_paths if p.lower().endswith((".jpg", ".jpeg", ".png"))
-    ]
+    image_paths = sorted(
+        p
+        for p in glob.glob(os.path.join(glob.escape(args.input_dir), "*"))
+        if p.lower().endswith(IMAGE_EXTENSIONS)
+    )
+    if not image_paths:
+        print(f"ERROR: No .jpg or .png images in {args.input_dir}")
+        sys.exit(1)
+    stems = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+    if len(set(stems)) < len(stems):
+        print("ERROR: Several images share a file stem, their masks would collide")
+        sys.exit(1)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"Found {len(image_paths)} images. Loading SAM3...")
-
-    torch.cuda.empty_cache()
-    gc.collect()
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    processor = Sam3Processor(build_sam3_image_model())
 
-    model = build_sam3_image_model()
-    processor = Sam3Processor(model, confidence_threshold=0.5)
-
-    #primary_prompts = ["river", "stream", "creek", "shallow water"]
-    primary_prompts = ["ocean", "sea", "shallow water"]
-    #fallback_prompts = ["dark river", "stream", "creek", "flowing river"]
-    fallback_prompts = ["shallow water", "coastal water", "clear water", "sea", "ocean"]
-    primary_confidence = 0.5  # Slightly lower to catch seagrass
-    fallback_confidence = 0.3
-
-    failed_images = []
-
-    for img_path in tqdm(image_paths, desc="Segmenting"):
+    no_water, failed = [], []
+    for path in tqdm(image_paths, desc="Segmenting"):
+        name = os.path.basename(path)
         try:
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            image_pil = Image.open(img_path).convert("RGB")
-            orig_w, orig_h = image_pil.size
-            image_resized, _ = resize_image(image_pil, MAX_IMAGE_SIZE)
-
-            masks, used_prompt, used_conf = try_prompts_with_merging(
+            image = Image.open(path).convert("RGB")
+            W, H = image.size
+            masks, fallback_prompt = segment(
                 processor,
-                image_resized,
-                primary_prompts,
-                fallback_prompts,
-                primary_confidence,
-                fallback_confidence,
+                resize_image(image, args.max_image_size),
+                PROMPTS[args.scene],
+                args.primary_conf,
+                args.fallback_conf,
             )
+            binary_mask = union_masks(masks, H, W)
+            if not masks:
+                no_water.append(name)
+                tqdm.write(f"  {name}: no water found, saved an all-land mask")
+            elif fallback_prompt is not None:
+                tqdm.write(f"  {name}: fallback prompt '{fallback_prompt}'")
 
-            binary_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
-
-            if masks is not None and len(masks) > 0:
-                for mask in masks:
-                    if isinstance(mask, torch.Tensor):
-                        mask = mask.cpu().numpy()
-
-                    if mask.ndim == 3:
-                        mask = mask.squeeze(0)
-
-                    mask_resized = cv2.resize(
-                        mask.astype(np.float32),
-                        (orig_w, orig_h),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    binary_mask = np.maximum(
-                        binary_mask, (mask_resized > 0.5).astype(np.uint8) * 255
-                    )
-
-                if str(used_prompt) != str(primary_prompts):
-                    tqdm.write(
-                        f"  {os.path.basename(img_path)}: used fallback '{used_prompt}' @ {used_conf}"
-                    )
-            else:
-                failed_images.append(os.path.basename(img_path))
-                tqdm.write(f"  {os.path.basename(img_path)}: NO MASKS FOUND")
-
-            if HSV_RECOVERY_ENABLED:
-                image_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-
-            if HSV_RECOVERY_ENABLED:
-                binary_mask, n_recovered = hsv_recover_water(image_bgr, binary_mask)
+            if args.hsv_recovery:
+                binary_mask, n_recovered = hsv_recover_water(
+                    np.array(image), binary_mask
+                )
                 if n_recovered > 0:
-                    pct_recovered = n_recovered / (orig_h * orig_w) * 100
                     tqdm.write(
-                        f"  {os.path.basename(img_path)}: HSV recovered {n_recovered:,} px (+{pct_recovered:.1f}%)"
+                        f"  {name}: HSV recovered {n_recovered:,} px "
+                        f"(+{100 * n_recovered / (H * W):.1f}%)"
                     )
 
-            # Save
-            filename = os.path.basename(img_path)
-            save_name = os.path.splitext(filename)[0] + ".png"
-            save_path = os.path.join(OUTPUT_DIR, save_name)
-            cv2.imwrite(save_path, binary_mask)
-
-            del masks, image_resized
+            mask_name = os.path.splitext(name)[0] + ".png"
+            Image.fromarray(binary_mask).save(os.path.join(args.output_dir, mask_name))
+        except Exception:
+            # load_llff.py drops all masks and 07_make_pointcloud.py pairs them by
+            # position if one is missing, so record it and exit 1 after the loop
+            failed.append(name)
+            tqdm.write(f"  {name}: failed\n{traceback.format_exc()}")
+        finally:
             torch.cuda.empty_cache()
             gc.collect()
 
-        except Exception as e:
-            # Print all of the error (need to see what's happening if it fails again...)
-            import traceback
-
-            traceback.print_exc()
-            print(f"\nError processing {img_path}: {e}")
-            torch.cuda.empty_cache()
-            gc.collect()
-            continue
-
-    print("\nDone! Masks saved to:", OUTPUT_DIR)
-    if failed_images:
-        print(f"\nFailed images ({len(failed_images)}):")
-        for f in failed_images:
-            print(f"  - {f}")
+    print(f"\nSaved {len(image_paths) - len(failed):,} masks to {args.output_dir}")
+    if no_water:
+        print(f"No water found in {len(no_water)} images: {', '.join(no_water)}")
+    if failed:
+        print(f"ERROR: No mask for {len(failed)} images: {', '.join(failed)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    generate_masks()
+    main()
