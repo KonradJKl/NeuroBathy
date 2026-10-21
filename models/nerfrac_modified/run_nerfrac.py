@@ -16,9 +16,6 @@ import pandas as pd
 from run_nerfrac_helpers import *
 
 from load_llff import load_llff_data
-from load_deepvoxels import load_dv_data
-from load_blender import load_blender_data
-from load_LINEMOD import load_LINEMOD_data
 from collections import OrderedDict
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -728,7 +725,7 @@ def create_nerf(args):
     }
 
     # NDC only good for LLFF-style forward facing data
-    if args.dataset_type != "llff" or args.no_ndc:
+    if args.no_ndc:
         print("Not ndc!")
         render_kwargs_train["ndc"] = False
         render_kwargs_train["lindisp"] = args.lindisp
@@ -1018,38 +1015,18 @@ def config_parser():
         "--dataset_type",
         type=str,
         default="llff",
-        help="options: llff / blender / deepvoxels",
-    )
-    parser.add_argument(
-        "--testskip",
-        type=int,
-        default=8,
-        help="will load 1/N images from test/val sets, useful for large datasets like deepvoxels",
+        choices=["llff"],
+        help="only LLFF-format scenes are supported",
     )
     parser.add_argument(
         "--use_mask_selection",
         action="store_true",
         help="Use water masks for selective ray sampling during training",
     )
-
-    # deepvoxels flags
-    parser.add_argument(
-        "--shape",
-        type=str,
-        default="greek",
-        help="options : armchair / cube / greek / vase",
-    )
-
-    # blender flags
     parser.add_argument(
         "--white_bkgd",
         action="store_true",
-        help="set to render synthetic data on a white bkgd (always use for dvoxels)",
-    )
-    parser.add_argument(
-        "--half_res",
-        action="store_true",
-        help="load blender synthetic data at 400x400 instead of 800x800",
+        help="composite rendered colors onto a white background",
     )
 
     # llff flags
@@ -1233,95 +1210,49 @@ def train():
     writer = SummaryWriter("./tensorboard/" + args.expname)
 
     # Load data
-    K = None
-    if args.dataset_type == "llff":
-        images, masks, poses, bds, render_poses, i_test = load_llff_data(
-            args.datadir,
-            args.factor,
-            recenter=True,
-            bd_factor=0.75,
-            spherify=args.spherify,
-            load_masks=True,
-        )
-        use_masks = masks is not None
-        if use_masks:
-            print(f"Using water masks for ray selection, shape: {masks.shape}")
-            masks = np.transpose(masks, [2, 0, 1])  # [N, H, W]
-        else:
-            print("No masks found, training without mask-based ray selection")
+    images, masks, poses, bds, render_poses, i_test = load_llff_data(
+        args.datadir,
+        args.factor,
+        recenter=True,
+        bd_factor=0.75,
+        spherify=args.spherify,
+        load_masks=True,
+    )
+    use_masks = masks is not None
+    if use_masks:
+        print(f"Using water masks for ray selection, shape: {masks.shape}")
+        masks = np.transpose(masks, [2, 0, 1])  # [N, H, W]
+    else:
+        print("No masks found, training without mask-based ray selection")
 
-        hwf = poses[0, :3, -1]
-        poses = poses[:, :3, :4]
-        print("Loaded llff", images.shape, render_poses.shape, hwf, args.datadir)
-        if not isinstance(i_test, list):
-            i_test = [i_test]
+    hwf = poses[0, :3, -1]
+    poses = poses[:, :3, :4]
+    print("Loaded llff", images.shape, render_poses.shape, hwf, args.datadir)
+    if not isinstance(i_test, list):
+        i_test = [i_test]
 
-        if args.llffhold > 0:
-            print("Auto LLFF holdout,", args.llffhold)
-            i_test = np.arange(images.shape[0])[:: args.llffhold]
-        i_test = [int(x) for x in args.tframe.split(",")]
-        i_val = i_test
-        i_train = np.array(
-            [
-                i
-                for i in np.arange(int(images.shape[0]))
-                if (i not in i_test and i not in i_val)
-            ]
-        )
+    if args.llffhold > 0:
+        print("Auto LLFF holdout,", args.llffhold)
+        i_test = np.arange(images.shape[0])[:: args.llffhold]
+    i_test = [int(x) for x in args.tframe.split(",")]
+    i_val = i_test
+    i_train = np.array(
+        [
+            i
+            for i in np.arange(int(images.shape[0]))
+            if (i not in i_test and i not in i_val)
+        ]
+    )
 
-        print("DEFINING BOUNDS")
-        if args.no_ndc:
-            near = np.ndarray.min(bds) * 0.9
-            far = np.ndarray.max(bds) * 1.0
-
-        else:
-            near = 0.0
-            far = 1.0
-        print("NEAR FAR", near, far)
-
-    elif args.dataset_type == "blender":
-        images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip
-        )
-        print("Loaded blender", images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        near = 2.0
-        far = 6.0
-
-        if args.white_bkgd:
-            images = images[..., :3] * images[..., -1:] + (1.0 - images[..., -1:])
-        else:
-            images = images[..., :3]
-
-    elif args.dataset_type == "LINEMOD":
-        images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(
-            args.datadir, args.half_res, args.testskip
-        )
-        print(f"Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}")
-        print(f"[CHECK HERE] near: {near}, far: {far}.")
-        i_train, i_val, i_test = i_split
-
-        if args.white_bkgd:
-            images = images[..., :3] * images[..., -1:] + (1.0 - images[..., -1:])
-        else:
-            images = images[..., :3]
-
-    elif args.dataset_type == "deepvoxels":
-        images, poses, render_poses, hwf, i_split = load_dv_data(
-            scene=args.shape, basedir=args.datadir, testskip=args.testskip
-        )
-
-        print("Loaded deepvoxels", images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
-        near = hemi_R - 1.0
-        far = hemi_R + 1.0
+    print("DEFINING BOUNDS")
+    if args.no_ndc:
+        near = np.ndarray.min(bds) * 0.9
+        far = np.ndarray.max(bds) * 1.0
 
     else:
-        print("Unknown dataset type", args.dataset_type, "exiting")
-        return
+        near = 0.0
+        far = 1.0
+    print("NEAR FAR", near, far)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -1330,8 +1261,7 @@ def train():
     hwf = [H, W, focal]
 
     # 定义内参矩阵
-    if K is None:
-        K = np.array([[focal, 0, 0.5 * W], [0, focal, 0.5 * H], [0, 0, 1]])
+    K = np.array([[focal, 0, 0.5 * W], [0, focal, 0.5 * H], [0, 0, 1]])
     print("K:", K)
     args.H = H
     args.W = W
@@ -1368,19 +1298,18 @@ def train():
 
     # Save coordinate system metadata for post-processing scripts
     # (c2w.npy was overwritten each run by recenter_poses)
-    if args.dataset_type == "llff":
-        import shutil
+    import shutil
 
-        exp_dir = os.path.join(basedir, expname)
-        c2w_src = os.path.join(os.getcwd(), "c2w.npy")
-        c2w_dst = os.path.join(exp_dir, "c2w.npy")
-        if os.path.exists(c2w_src):
-            shutil.copy2(c2w_src, c2w_dst)
-        pb = np.load(os.path.join(args.datadir, "poses_bounds.npy"))
-        bds_raw = pb[:, -2:]
-        sc = 1.0 / (bds_raw.min() * 0.75)
-        np.save(os.path.join(exp_dir, "llff_scale.npy"), np.array([sc]))
-        print(f"Saved c2w.npy and llff_scale.npy (sc={sc:.8f}) to {exp_dir}")
+    exp_dir = os.path.join(basedir, expname)
+    c2w_src = os.path.join(os.getcwd(), "c2w.npy")
+    c2w_dst = os.path.join(exp_dir, "c2w.npy")
+    if os.path.exists(c2w_src):
+        shutil.copy2(c2w_src, c2w_dst)
+    pb = np.load(os.path.join(args.datadir, "poses_bounds.npy"))
+    bds_raw = pb[:, -2:]
+    sc = 1.0 / (bds_raw.min() * 0.75)
+    np.save(os.path.join(exp_dir, "llff_scale.npy"), np.array([sc]))
+    print(f"Saved c2w.npy and llff_scale.npy (sc={sc:.8f}) to {exp_dir}")
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(
