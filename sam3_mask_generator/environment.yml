@@ -1,0 +1,28 @@
+# SAM3 water masks, separate from the main environment because SAM3 needs
+# Python 3.12 and torch 2.7. torch 2.7.0 from PyPI uses CUDA 12.6.
+# The SAM3 checkpoint is gated: request access on Hugging Face, then `hf auth login`.
+#   conda env create -f sam3_mask_generator/environment.yml
+name: neurobathy-sam3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - git
+  - pip
+  - pip:
+      - torch==2.7.0
+      - torchvision==0.22.0
+      - numpy==1.26.4
+      - scipy==1.17.0
+      - opencv-python==4.11.0.86
+      - Pillow==12.0.0
+      - tqdm==4.67.1
+      - sam3 @ git+https://github.com/facebookresearch/sam3@11dec2936de97f2857c1f76b66d982d5a001155d
+      - timm==1.0.24
+      - huggingface_hub==1.3.4
+      # imported by sam3 but missing from its dependencies
+      - setuptools==80.10.1  # pkg_resources, removed in setuptools 82
+      - einops==0.8.1
+      - decord==0.6.0
+      - pycocotools==2.0.11
+      - psutil==7.2.1

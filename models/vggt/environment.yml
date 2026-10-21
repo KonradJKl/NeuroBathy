@@ -1,0 +1,19 @@
+# VGGT inference (run_vggt_inference.py), separate from the main environment
+# because VGGT pins torch 2.3.1. torch 2.3.1 from PyPI uses CUDA 12.1.
+# The VGGT-1B weights (about 5 GB) are downloaded on the first run.
+#   conda env create -f models/vggt/environment.yml
+name: neurobathy-vggt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - git
+  - pip
+  - pip:
+      - torch==2.3.1
+      - torchvision==0.18.1
+      - numpy==1.26.1
+      - Pillow==11.3.0
+      - vggt @ git+https://github.com/facebookresearch/vggt@44b3afbd1869d8bde4894dd8ea1e293112dd5eba
+      - huggingface_hub==0.35.3
+      - einops==0.8.1

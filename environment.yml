@@ -1,0 +1,29 @@
+# NeRFrac training and rendering, and the postprocessing scripts.
+# Pinned to the versions behind the thesis results; torch 2.5.1 from PyPI uses CUDA 12.4.
+#   conda env create -f environment.yml
+name: neurobathy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch==2.5.1
+      - torchvision==0.20.1
+      - numpy==1.26.4
+      - scipy==1.10.1
+      - pandas==2.3.2
+      - matplotlib==3.10.6
+      - Pillow==11.3.0
+      - imageio==2.37.0
+      - imageio-ffmpeg==0.6.0
+      - opencv-python-headless==4.8.1.78
+      - scikit-image==0.21.0
+      - lpips==0.1.4
+      - ConfigArgParse==1.7.1
+      - tensorboard==2.20.0
+      - tqdm==4.67.1
+      - rasterio==1.4.4
+      - pyproj==3.7.1
+      - laspy==2.7.0
+      - lazrs==0.8.1

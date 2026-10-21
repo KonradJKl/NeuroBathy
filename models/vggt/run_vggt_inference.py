@@ -4,20 +4,16 @@ and predicted cameras for the postprocessing pipeline (01, 02, 04, 07).
 
 Usage examples:
     # Depth unprojection (default)
-    python run_vggt_inference.py \\
+    python models/vggt/run_vggt_inference.py \\
         --image_dir /path/to/pielach_oblique/images \\
         --output_dir /path/to/vggt_obq
 
     # Point-map head, with separate water and land point clouds
-    python run_vggt_inference.py \\
+    python models/vggt/run_vggt_inference.py \\
         --image_dir /path/to/pielach_oblique/images \\
         --output_dir /path/to/vggt_obq_pointmap \\
         --mask_dir /path/to/pielach_oblique/masks \\
         --use_point_map
-
-Requires the vggt package (Python >= 3.10): pip install -e on a clone of
-https://github.com/facebookresearch/vggt. The VGGT-1B weights (about 5 GB) are
-downloaded on the first run.
 
 Per-view outputs (NNN = index in sorted filename order):
     depth_NNN.npy              camera z-depth [H, W]
