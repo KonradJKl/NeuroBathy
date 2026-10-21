@@ -515,7 +515,8 @@ def compute_metrics(gt, pred, label=""):
     N = len(gt)
     if N < 3:
         out = {"N": N, "pearson_r": np.nan, "spearman_rho": np.nan,
-               "rmse": np.nan, "mae": np.nan, "bias": np.nan}
+               "rmse": np.nan, "mae": np.nan, "bias": np.nan,
+               "scale_ratio": np.nan}
         if label:
             out["label"] = label
         return out
