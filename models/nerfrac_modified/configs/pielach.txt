@@ -29,4 +29,3 @@ raw_noise_std = 1e0
 
 render_only = 0
 render_test = 0
-check_weight = 0

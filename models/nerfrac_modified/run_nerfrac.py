@@ -1,22 +1,17 @@
 import os
-import sys
 import numpy as np
 import imageio
-import json
 import random
 import time
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
 from torch.utils.tensorboard import SummaryWriter
 from utils import *
-import matplotlib.pyplot as plt
 import pandas as pd
 from run_nerfrac_helpers import *
 
 from load_llff import load_llff_data
-from collections import OrderedDict
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,9 +24,6 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-DEBUG = False
 
 
 def build_consistency_rays(rays_o_full, rays_d_full, coords, H, W):
@@ -672,43 +664,13 @@ def create_nerf(args):
         ckpt_path = ckpts[-1]
         print("Reloading from", ckpt_path)
         ckpt = torch.load(ckpt_path)
-        if not args.frozen_nerf:
-            print("~~~~~~~~~~~~~~~~~~load checkpoint mode~~~~~~~~~~~~~~~~")
-            start = ckpt["global_step"]
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            fn_state = {
-                k.replace("_orig_mod.", ""): v
-                for k, v in ckpt["network_fn_state_dict"].items()
-            }
-            model.load_state_dict(fn_state)
-        else:
-            print("~~~~~~~~~~~~~~~~~~~freeze nerf mode~~~~~~~~~~~~~~~~~~~")
-            for name in model.state_dict():
-                print(name)
-            new_state_dict = OrderedDict()
-
-            for k, v in ckpt["network_fn_state_dict"].items():
-                k = "_occ." + k
-                if k[0:4] == "_occ":
-                    new_state_dict[k] = v
-
-            for k, v in ckpt["network_fine_state_dict"].items():
-                k = "_occfine." + k
-                if k[0:4] == "_occ":
-                    new_state_dict[k] = v
-
-            start = ckpt["global_step"]
-
-            model.load_state_dict(new_state_dict, strict=False)
-            for name, value in model.named_parameters():
-                if name[:4] == "_occ":
-                    value.requires_grad = False
-
-    if args.check_weight == 1:
-        for name in model.state_dict():
-            print(name)
-        print(model.state_dict()["_occ.pts_linears.7.weight"].shape)
-        sys.exit()
+        start = ckpt["global_step"]
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        fn_state = {
+            k.replace("_orig_mod.", ""): v
+            for k, v in ckpt["network_fn_state_dict"].items()
+        }
+        model.load_state_dict(fn_state)
     ##########################
 
     render_kwargs_train = {
@@ -845,10 +807,6 @@ def render_rays(
     ret["weights"] = weights
     ret["z_vals"] = z_vals
 
-    for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.")
-
     return ret
 
 
@@ -918,9 +876,6 @@ def config_parser():
     )
     parser.add_argument(
         "--no_reload", action="store_true", help="do not reload weights from saved ckpt"
-    )
-    parser.add_argument(
-        "--frozen_nerf", action="store_true", help="freeze nerf for training"
     )
     parser.add_argument(
         "--ft_path",
@@ -1054,7 +1009,6 @@ def config_parser():
     )
 
     # logging/saving options
-    parser.add_argument("--check_weight", type=int, default=0)
     parser.add_argument(
         "--i_print",
         type=int,
@@ -1779,7 +1733,6 @@ def train():
                 {
                     "global_step": global_step,
                     "network_fn_state_dict": save_state,
-                    # 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                 },
                 path,
