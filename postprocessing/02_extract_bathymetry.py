@@ -7,7 +7,7 @@ Usage examples:
         --mode nerfrac \\
         --testset_dir /path/to/testset_all_950000 \\
         --log_folder /path/to/experiment_log \\
-        --umeyama_npz transforms/nerfrac_50m_umeyama.npz \\
+        --umeyama_npz ../data/transforms/nerfrac_50m_umeyama.npz \\
         --mask_dir /path/to/masks_8 \\
         --wsm_path /path/to/WSM.tif \\
         --output_csv bathymetry/bathymetry_nerfrac_50m.csv
@@ -16,7 +16,7 @@ Usage examples:
     python 02_extract_bathymetry.py \\
         --mode vggt \\
         --vggt_dir /path/to/vggt_output \\
-        --umeyama_npz transforms/vggt_50m_umeyama.npz \\
+        --umeyama_npz ../data/transforms/vggt_50m_v1_umeyama.npz \\
         --mask_dir /path/to/masks_8 \\
         --wsm_path /path/to/WSM.tif \\
         --output_csv bathymetry/bathymetry_vggt_50m.csv

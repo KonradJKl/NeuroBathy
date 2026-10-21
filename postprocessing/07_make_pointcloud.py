@@ -6,7 +6,7 @@ Usage (VGGT):
         --mode vggt \\
         --vggt_dir '/path/to/vggt_output' \\
         --output_dir pointclouds/vggt_nadir \\
-        --umeyama_npz transforms/vggt_nadir_umeyama.npz \\
+        --umeyama_npz ../data/transforms/vggt_nadir_umeyama.npz \\
         --conf_threshold 0.5
 
 Usage (NeRFrac):
@@ -16,7 +16,7 @@ Usage (NeRFrac):
         --testset testset_all_600000 \\
         --poses_bounds data/nerf_llff_data/pielach_data/poses_bounds.npy \\
         --factor 4 \\
-        --umeyama_npz transforms/nerfrac_nadir_umeyama.npz \\
+        --umeyama_npz ../data/transforms/nerfrac_nadir_umeyama.npz \\
         --mask_dir data/nerf_llff_data/pielach_data/masks_4 \\
         --output_dir pointclouds/nerfrac_f4
 """

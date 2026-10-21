@@ -18,7 +18,7 @@ Analytical Snell's law refraction correction for VGGT depth predictions.
     # Afterwards extract bathymetry from the corrected output:
     python 02_extract_bathymetry.py --mode vggt \\
         --vggt_dir '/path/to/corrected_output' \\
-        --umeyama_npz transforms/<umeyama.npz> \\
+        --umeyama_npz ../data/transforms/<umeyama.npz> \\
         --wsm_path <WSM.tif> \\
         --mask_dir '/path/to/masks' \\
         --output_csv bathymetry/bathymetry_corrected.csv

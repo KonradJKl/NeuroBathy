@@ -7,7 +7,7 @@ Usage:
         --poses_bounds data/nerf_llff_data/pielach_data/poses_bounds.npy \\
         --factor 4 \\
         --wsm_path '/path/to/Pielach_20241024_WSM.tif' \\
-        --umeyama_npz transforms/nerfrac_nadir_umeyama.npz \\
+        --umeyama_npz ../data/transforms/nerfrac_nadir_umeyama.npz \\
         --output_dir ./water_surface/f4 \\
         --label 'NeRFrac f4'
 """
