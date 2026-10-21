@@ -21,6 +21,7 @@ The RMS values are the residuals of the camera fit. The large residuals of the V
 oblique and 50 m transforms come from VGGT's camera estimates for these image sets.
 
 Derived from the Pielach River dataset (G. Mandlburger, TU Wien, CC BY 4.0,
-https://doi.org/10.48436/taz19-r6618), see `data/gt/pielach/README.md`. The `vggt_*`
-files are computed from VGGT-1B camera estimates. The VGGT-1B weights are licensed
-CC BY-NC 4.0.
+https://doi.org/10.48436/taz19-r6618), see `data/gt/pielach/README.md`. These files are
+licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and are not covered
+by the MIT license of the code. The `vggt_*` files are computed from VGGT-1B camera
+estimates. The VGGT-1B weights are licensed CC BY-NC 4.0.
