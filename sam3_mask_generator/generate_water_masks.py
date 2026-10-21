@@ -3,13 +3,13 @@ Generate binary water masks with SAM3 text prompts.
 
 Usage examples:
     # Pielach (river)
-    python sam3_mask_generator/masking_merge.py \\
+    python sam3_mask_generator/generate_water_masks.py \\
         --input_dir data/model_formatted/nerfrac/pielach_data/images_8 \\
         --output_dir data/model_formatted/nerfrac/pielach_data/masks_8 \\
         --scene river
 
     # Coastal scene with seagrass
-    python sam3_mask_generator/masking_merge.py \\
+    python sam3_mask_generator/generate_water_masks.py \\
         --input_dir /path/to/coast/images_4 \\
         --output_dir /path/to/coast/masks_4 \\
         --scene coastal \\
