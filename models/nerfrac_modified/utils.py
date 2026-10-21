@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# The constants and the image and colorbar helpers come from NeRF++
+# (BSD-2-Clause, Copyright (c) 2020, the NeRF++ authors), see LICENSE-BSD-NERFPP.
+#
+# Modified by Konrad Kloska, 2026: SSIM computed with OpenCV (ssim,
+# ssim_single_channel), following BasicSR's calculate_ssim. A copy of the
+# Apache license is in LICENSE-APACHE.
 
 
 import torch
