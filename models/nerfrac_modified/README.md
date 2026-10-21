@@ -35,9 +35,9 @@ Changes made for shallow-water bathymetry from drone imagery:
 - SSIM computed with OpenCV instead of scikit-image (`utils.py`).
 
 The original README, demo scenes and synthetic configs are in the upstream
-repository. The upstream configs set `check_weight`, which this copy no longer
-accepts, so delete that line before using them. Please cite NeRFrac if you use
-this code:
+repository. The upstream configs set `llffhold` and `check_weight`, which this
+copy no longer accepts, so delete those two lines before using them. Please
+cite NeRFrac if you use this code:
 
 ```
 @inproceedings{zhan2023nerfrac,

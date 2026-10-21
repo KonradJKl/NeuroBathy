@@ -16,7 +16,6 @@ tframe = 4
 omultires = 0
 refracvmultires = 0
 factor = 1
-llffhold = 8
 
 N_iter = 200000
 N_rand = 500

@@ -719,7 +719,6 @@ def render_rays(
     water,
     N_samples,
     N_importance,
-    retraw=False,
     white_bkgd=False,
     raw_noise_std=0.0,
     water_mask=None,
@@ -756,8 +755,6 @@ def render_rays(
     ret["depth_map"] = depth_map
     ret["depth_mode"] = depth_mode  # NEW
     ret["water_mask"] = wm
-    if retraw:
-        ret["raw"] = raw
     ret["weights"] = weights
     ret["z_vals"] = z_vals
 
@@ -944,12 +941,6 @@ def config_parser():
     parser.add_argument(
         "--spherify", action="store_true", help="set for spherical 360 scenes"
     )
-    parser.add_argument(
-        "--llffhold",
-        type=int,
-        default=8,
-        help="will take every 1/N images as LLFF test set, paper uses 8",
-    )
 
     # logging/saving options
     parser.add_argument(
@@ -1100,7 +1091,7 @@ def train():
     writer = SummaryWriter("./tensorboard/" + args.expname)
 
     # Load data
-    images, masks, poses, _, render_poses, i_test = load_llff_data(
+    images, masks, poses, _, render_poses, _ = load_llff_data(
         args.datadir,
         args.factor,
         recenter=True,
@@ -1118,21 +1109,10 @@ def train():
     hwf = poses[0, :3, -1]
     poses = poses[:, :3, :4]
     print("Loaded llff", images.shape, render_poses.shape, hwf, args.datadir)
-    if not isinstance(i_test, list):
-        i_test = [i_test]
 
-    if args.llffhold > 0:
-        print("Auto LLFF holdout,", args.llffhold)
-        i_test = np.arange(images.shape[0])[:: args.llffhold]
     i_test = [int(x) for x in args.tframe.split(",")]
     i_val = i_test
-    i_train = np.array(
-        [
-            i
-            for i in np.arange(int(images.shape[0]))
-            if (i not in i_test and i not in i_val)
-        ]
-    )
+    i_train = np.array([i for i in range(len(images)) if i not in i_test])
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -1356,7 +1336,6 @@ def train():
 
     start = start + 1
     for i in trange(start, N_iters):
-        time0 = time.time()
         batch_wm = None  # per-ray water mask
 
         # Sample random ray batch
@@ -1466,13 +1445,12 @@ def train():
         #####  Core optimization loop  #####
         # batch_wm is set by both use_batching and no_batching paths;
         # it may be None when no masks are available.
-        rgb, disp, acc, Xs, _, _, extras = render(
+        rgb, _, _, Xs, _, _, extras = render(
             H,
             W,
             K,
             chunk=args.chunk,
             rays=batch_rays,
-            retraw=True,
             pixel_water_mask=batch_wm,
             **render_kwargs_train,
         )
@@ -1484,9 +1462,6 @@ def train():
 
         img_loss = img2mse(rgb, target_s)
 
-        trans = extras["raw"][..., -1]
-
-        loss = img_loss
         model = render_kwargs_train["network_fn"]
         dD_out = extras["dD"]
         dD_reshaped = dD_out.view(-1, 9)
@@ -1543,12 +1518,6 @@ def train():
             loss = loss + effective_dist_weight * dist_loss
 
         psnr = mse2psnr(img_loss)
-
-        # Coarse network loss
-        if "rgb0" in extras:
-            img_loss0 = img2mse(extras["rgb0"], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
 
         # --- Multi-view depth consistency loss ---
         consistency_loss = torch.tensor(0.0, device=device)
@@ -1639,8 +1608,6 @@ def train():
         for param_group in optimizer.param_groups:
             param_group["lr"] = new_lrate
         ################################
-
-        dt = time.time() - time0
 
         # Rest is logging
         if i % args.i_weights == 0:
