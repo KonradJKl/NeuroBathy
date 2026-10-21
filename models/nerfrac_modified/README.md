@@ -1,56 +1,43 @@
-# NeRFrac: Neural Radiance Fields through Refractive Surface
+# Modified NeRFrac
 
-<img src="https://github.com/Yifever20002/NeRFrac/blob/main/images/real_fish.gif" alt="fish" width="320" height="240">  <img src="https://github.com/Yifever20002/NeRFrac/blob/main/images/real_redflower.gif" alt="redflower" width="320" height="240">
+This folder is a modified copy of
+[NeRFrac: Neural Radiance Fields through Refractive Surface](https://github.com/Yifever20002/NeRFrac)
+(Zhan, Nobuhara, Nishino, Zheng, ICCV 2023), based on upstream commit `5e2e848`.
+The rendering core and the data loaders come from NeRF / nerf-pytorch through NeRFrac.
 
-<img src="https://github.com/Yifever20002/NeRFrac/blob/main/images/real_tree.gif" alt="tree" width="320" height="240">  <img src="https://github.com/Yifever20002/NeRFrac/blob/main/images/real_plant.gif" alt="plant" width="320" height="240">
+Changes made for shallow-water bathymetry from drone imagery:
 
+- Per-ray water/land routing: water rays go through the refractive field and
+  Snell's law, land rays are rendered along straight lines. Both share the
+  radiance MLP and are scattered back into one batch (`run_nerfrac_helpers.py`,
+  `NeRFrac.forward`).
+- Water masks are loaded with the images (`load_llff.py`) and follow each ray
+  through batching and rendering.
+- Additional losses: distortion loss (Mip-NeRF 360), cross-view depth
+  consistency and an optional water-surface flatness term. The refractive-field
+  smoothness term that upstream defines but never calls (`NeRFrac.smooth`) is
+  applied to water rays (`--smooth_weight`, default 0.01, with warmup).
+- Training safeguards: gradient clipping (`--grad_clip`, default 1.0), batches
+  with a NaN or Inf loss are skipped, the refractive offset is clamped to
+  [-1, 1] and the Snell's-law radicand is clamped (no NaN under total internal
+  reflection).
+- Optional water-first ray sampling (`--use_mask_selection`, with `--no_batching`).
+- Expected depth, mode depth (sample with the highest weight) and accumulated
+  opacity are saved for every rendered view; upstream saved only the RGB image
+  and the surface points.
+- `c2w.npy`, which upstream writes to the working directory, is copied into each
+  experiment folder next to a new `llff_scale.npy`, so the postprocessing can
+  map renders back to COLMAP and UTM coordinates.
+- Vectorized 3x3 neighbour-ray gathering (border pixels use edge replication
+  instead of upstream's shifted window), `solve_triangular` for the surface
+  normal, registered buffers for H/W/f, and TF32 / `torch.compile` settings.
+- Fixed squeeze dimensions for chunks that contain a single water ray.
+- SSIM computed with OpenCV instead of scikit-image (`utils.py`).
 
-This is the repo for the ICCV 2023 project
+The original README, demo scenes and synthetic configs are in the upstream
+repository. Please cite NeRFrac if you use this code:
 
->[NeRFrac: Neural Radiance Fields through Refractive Surface](https://openaccess.thecvf.com/content/ICCV2023/html/Zhan_NeRFrac_Neural_Radiance_Fields_through_Refractive_Surface_ICCV_2023_paper.html)\
->[Yifan Zhan](https://yifever20002.github.io/yifanzhan.github.io/), Shohei Nobuhara, Ko Nishino, Yinqiang Zheng\
->IEEE International Conference on Computer Vision (ICCV), 2023
-
-![image](https://github.com/Yifever20002/NeRFrac/blob/main/images/pipeline.png)
-
-## About NeRFrac
-
-Neural Radiance Fields (NeRF) is a popular neural expression for novel view synthesis. By querying spatial points and view directions, a multilayer perceptron (MLP) can be trained to output the volume density and radiance at each point, which lets us render novel views of the scene. The original NeRF and its recent variants, however, target opaque scenes dominated by diffuse reflection surfaces and cannot handle complex refractive surfaces well. We introduce NeRFrac to realize neural novel view synthesis of scenes captured through refractive surfaces, typically water surfaces. For each queried ray, an MLP-based Refractive Field is trained to estimate the distance from the ray origin to the refractive surface. A refracted ray at each intersection point is then computed by Snell's Law, given the input ray and the approximated local normal. Points of the scene are sampled along the refracted ray and are sent to a Radiance Field for further radiance estimation. We show that from a sparse set of images, our model achieves accurate novel view synthesis of the scene underneath the refractive surface and simultaneously reconstructs the refractive surface. We evaluate the effectiveness of our method with synthetic and real scenes seen through water surfaces. Experimental results demonstrate the accuracy of NeRFrac for modeling scenes seen through wavy refractive surfaces.
-
-
-## Installation
-
-``````
-git clone https://github.com/Yifever20002/NeRFrac.git
-cd NeRFrac
-conda create -n NeRFrac python=3.6
-conda activate NeRFrac
-conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch -c nvidia
-pip install -r requirements.txt
-``````
-
-
-## Demo Data
-
-This part encompasses single-frame multi-view data in both the main text and the supplementary material, including images and [COLMAP](https://colmap.github.io/)-calibrated camera poses (with original image resolution, 2048&times;1536 for real data and 392&times;392 for synthetic data). We use "images_4" for real data training and "images_1" for synthetic data training. Download from [here](https://drive.google.com/drive/folders/1A78v0qNCQlqS01AD77IqjhNrL9p0rkBF?usp=sharing) and place them under /pth/to/NeRFrac/data/nerf_llff_data/ .
-
-
-## How to run?
-
-To train a specific data, use
-``````
-python run_nerfrac.py --config configs/syn_primary_sine.txt
-``````
-
-To render a pre-trained model, set render_only == 1 and render_test == 1.
-
-To visualize the training process, use
-``````
-tensorboard --logdir=./tensorboard --port 8123
-``````
-
-## Citation
-``````
+```
 @inproceedings{zhan2023nerfrac,
   title={Nerfrac: Neural radiance fields through refractive surface},
   author={Zhan, Yifan and Nobuhara, Shohei and Nishino, Ko and Zheng, Yinqiang},
@@ -58,7 +45,7 @@ tensorboard --logdir=./tensorboard --port 8123
   pages={18402--18412},
   year={2023}
 }
-``````
+```
 
-
-
+License: MIT (`LICENSE`). `utils.py` is Apache-2.0 (`LICENSE-APACHE`) and
+contains BSD-2-Clause code from NeRF++ (`LICENSE-BSD-NERFPP`).
