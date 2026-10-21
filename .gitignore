@@ -73,6 +73,15 @@ logs/
 log/
 lightning_logs/
 
+# Outputs written into the repo by run_nerfrac.py and the postprocessing scripts
+models/nerfrac_modified/c2w.npy
+postprocessing/transforms/
+postprocessing/bathymetry/
+postprocessing/validation/
+postprocessing/validation_lidar/
+postprocessing/pointclouds/
+postprocessing/water_surface/
+
 
 # OS
 .DS_Store
