@@ -288,10 +288,9 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(rays_o, viewdirs, water_mask, fn, embed_fn, embeddirs_fn, netchunk=1024, N_samples=None, N_importance=None):
+def run_network(rays_o, viewdirs, water_mask, fn, netchunk=1024, N_samples=None, N_importance=None):
     """Prepares inputs and applies network 'fn'."""
-    if viewdirs is not None:
-        embedded = torch.cat([viewdirs, rays_o], -1)
+    embedded = torch.cat([viewdirs, rays_o], -1)
 
     embedded = torch.reshape(embedded, [-1, 9, 6])
     outputs_flat, Xs, z_vals, sample_ray, dD = batchify(fn, netchunk)(embedded, water_mask)
@@ -330,11 +329,6 @@ def render(
     rays=None,
     c2w=None,
     ndc=True,
-    savedir=None,
-    near=0.0,
-    far=1.0,
-    use_viewdirs=False,
-    c2w_staticcam=None,
     pixel_water_mask=None,
     **kwargs,
 ):
@@ -384,8 +378,6 @@ def render(
     rays_o = torch.reshape(rays_o, [-1, 9, 3])
     rays_d = torch.reshape(rays_d, [-1, 9, 3])
 
-    sh = rays_d.shape
-    
     # for forward facing scenes
     if ndc:
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1.0, rays_o, rays_d)
@@ -396,26 +388,8 @@ def render(
     if pixel_water_mask is not None:
         kwargs["water_mask"] = pixel_water_mask
 
-    # Render and reshape
+    # Render
     all_ret = batchify_rays(rays, chunk, **kwargs)
-
-    if rays_d.numel() % (9 * 3) == 0:
-        rays_d = rays_d.view([-1, 9, 3])
-        rays_d = rays_d[:, 0, :].squeeze()
-        sh = rays_d.shape
-
-    for k in all_ret:
-        if k == "Xs":
-            continue
-        if k == "sample_ray":
-            continue
-        if k == "dD":
-            continue
-        if k == "water_mask":
-            continue
-
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
     k_extract = ["rgb_map", "disp_map", "acc_map", "Xs", "depth_map", "sample_ray"]
     ret_list = [all_ret[k] for k in k_extract]
@@ -465,7 +439,6 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             K,
             chunk=chunk,
             c2w=c2w[:3, :4],
-            savedir=savedir,
             pixel_water_mask=pwm,
             **render_kwargs,
         )
@@ -606,6 +579,7 @@ def create_nerf(args):
     model_fine = None
     if args.N_importance > 0:
         # fine sampling is used in class NeRFrac forward and not here
+        # never called, but its parameters are in every checkpoint's optimizer state
         model_fine = NeRF.get_by_name(
             args.nerf_type,
             D=args.netdepth_fine,
@@ -632,8 +606,6 @@ def create_nerf(args):
             viewdirs,
             water_mask,
             network_fn,
-            embed_fn=embed_fn,
-            embeddirs_fn=embeddirs_fn,
             netchunk=args.netchunk,
             N_samples=N_samples,
             N_importance=N_importance,
@@ -676,12 +648,9 @@ def create_nerf(args):
     render_kwargs_train = {
         "network_query_fn": network_query_fn,
         "water": args.water,
-        "perturb": args.perturb,
         "N_importance": args.N_importance,
-        "network_fine": model_fine,
         "N_samples": args.N_samples,
         "network_fn": model,
-        "use_viewdirs": args.use_viewdirs,
         "white_bkgd": args.white_bkgd,
         "raw_noise_std": args.raw_noise_std,
     }
@@ -690,16 +659,14 @@ def create_nerf(args):
     if args.no_ndc:
         print("Not ndc!")
         render_kwargs_train["ndc"] = False
-        render_kwargs_train["lindisp"] = args.lindisp
 
     render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
-    render_kwargs_test["perturb"] = False
     render_kwargs_test["raw_noise_std"] = 0.0
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.0 - torch.exp(-act_fn(raw) * dists)
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -711,12 +678,6 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     noise = 0.0
     if raw_noise_std > 0.0:
         noise = torch.randn(raw[..., 3].shape, device=raw.device) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
-        if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
-            noise = torch.Tensor(noise).to(raw.device)
 
     alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
@@ -759,20 +720,13 @@ def render_rays(
     N_samples,
     N_importance,
     retraw=False,
-    lindisp=False,
-    perturb=0.0,
-    network_fine=None,
     white_bkgd=False,
     raw_noise_std=0.0,
-    verbose=False,
-    pytest=False,
     water_mask=None,
 ):
     rays_o, rays_d = ray_batch[:, :, 0:3], ray_batch[:, :, 3:6]
     rays_o = torch.reshape(rays_o, [-1, 3])
     rays_d = torch.reshape(rays_d, [-1, 3])
-
-    N_rays = rays_o.shape[0]
 
     viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
 
@@ -788,7 +742,7 @@ def render_rays(
         rays_o, viewdirs, wm, network_fn, N_samples, N_importance
     )
     rgb_map, disp_map, acc_map, weights, depth_map, depth_mode = raw2outputs(
-        raw, z_vals, sample_ray, raw_noise_std, white_bkgd, pytest=pytest
+        raw, z_vals, sample_ray, raw_noise_std, white_bkgd
     )
 
     ret = {
@@ -895,12 +849,6 @@ def config_parser():
         help="number of additional fine samples per ray",
     )
     parser.add_argument(
-        "--perturb",
-        type=float,
-        default=1.0,
-        help="set to 0. for no jitter, 1. for jitter",
-    )
-    parser.add_argument(
         "--use_viewdirs", action="store_true", help="use full 5D input instead of 3D"
     )
     parser.add_argument(
@@ -994,11 +942,6 @@ def config_parser():
         help="do not use normalized device coordinates (set for non-forward facing scenes)",
     )
     parser.add_argument(
-        "--lindisp",
-        action="store_true",
-        help="sampling linearly in disparity rather than depth",
-    )
-    parser.add_argument(
         "--spherify", action="store_true", help="set for spherical 360 scenes"
     )
     parser.add_argument(
@@ -1016,9 +959,6 @@ def config_parser():
         help="frequency of console printout and metric loggin",
     )
     parser.add_argument(
-        "--i_img", type=int, default=500, help="frequency of tensorboard image logging"
-    )
-    parser.add_argument(
         "--i_weights", type=int, default=10000, help="frequency of weight ckpt saving"
     )
     parser.add_argument(
@@ -1032,10 +972,6 @@ def config_parser():
     )
 
     parser.add_argument("--yita", type=float, default=1.0, help="refractive index")
-
-    parser.add_argument("--H", type=int, default=392)
-    parser.add_argument("--W", type=int, default=392)
-    parser.add_argument("--f", type=float, default=500.0, help="camera focal")
 
     parser.add_argument("--water", type=int, default=1, help="with water surface")
     parser.add_argument("--initdepth", type=float, default=-0.6, help="initial depth")
@@ -1164,7 +1100,7 @@ def train():
     writer = SummaryWriter("./tensorboard/" + args.expname)
 
     # Load data
-    images, masks, poses, bds, render_poses, i_test = load_llff_data(
+    images, masks, poses, _, render_poses, i_test = load_llff_data(
         args.datadir,
         args.factor,
         recenter=True,
@@ -1197,16 +1133,6 @@ def train():
             if (i not in i_test and i not in i_val)
         ]
     )
-
-    print("DEFINING BOUNDS")
-    if args.no_ndc:
-        near = np.ndarray.min(bds) * 0.9
-        far = np.ndarray.max(bds) * 1.0
-
-    else:
-        near = 0.0
-        far = 1.0
-    print("NEAR FAR", near, far)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -1275,13 +1201,6 @@ def train():
             model._occ = torch.compile(model._occ, mode="default")
             model._occfine = torch.compile(model._occfine, mode="default")
     global_step = start
-
-    bds_dict = {
-        "near": near,
-        "far": far,
-    }
-    render_kwargs_train.update(bds_dict)
-    render_kwargs_test.update(bds_dict)
 
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
@@ -1553,7 +1472,6 @@ def train():
             K,
             chunk=args.chunk,
             rays=batch_rays,
-            verbose=i < 10,
             retraw=True,
             pixel_water_mask=batch_wm,
             **render_kwargs_train,
