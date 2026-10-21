@@ -1,431 +1,397 @@
-import os
-import sys
+"""
+Run VGGT on a folder of images and save per-view depth, point maps, confidences
+and predicted cameras for the postprocessing pipeline (01, 02, 04, 07).
+
+Usage examples:
+    # Depth unprojection (default)
+    python run_vggt_inference.py \\
+        --image_dir /path/to/pielach_oblique/images \\
+        --output_dir /path/to/vggt_obq
+
+    # Point-map head, with separate water and land point clouds
+    python run_vggt_inference.py \\
+        --image_dir /path/to/pielach_oblique/images \\
+        --output_dir /path/to/vggt_obq_pointmap \\
+        --mask_dir /path/to/pielach_oblique/masks \\
+        --use_point_map
+
+Requires the vggt package (Python >= 3.10): pip install -e on a clone of
+https://github.com/facebookresearch/vggt. The VGGT-1B weights (about 5 GB) are
+downloaded on the first run.
+
+Per-view outputs (NNN = index in sorted filename order):
+    depth_NNN.npy              camera z-depth [H, W]
+    depth_conf_NNN.npy         depth confidence [H, W]
+    world_points_NNN.npy       world coordinates [H, W, 3], from unprojected depth
+                               or from the point map with --use_point_map
+    world_points_conf_NNN.npy  point-map confidence [H, W]
+    extrinsic_NNN.npy          camera-from-world [3, 4], OpenCV convention
+    intrinsic_NNN.npy          pinhole intrinsics [3, 3]
+    rgb_NNN.png                preprocessed input image
+"""
+
+import argparse
+import gc
 import glob
 import json
+import os
+import sys
 import time
-import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
-# Paths
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(_THIS_DIR)
-)
-
-# VGGT repo root
-VGGT_REPO_DIR = os.environ.get(
-    "VGGT_REPO_DIR",
-    "/path/to/vggt",
-)
-if VGGT_REPO_DIR not in sys.path:
-    sys.path.insert(0, VGGT_REPO_DIR)
-
 from vggt.models.vggt import VGGT
+from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+VGGT_WEIGHTS_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run VGGT dense inference and save depth maps, point clouds, and camera parameters."
+        description="Run VGGT inference and save per-view depth, point maps and cameras."
     )
+
+    # Input
     parser.add_argument(
         "--image_dir",
         type=str,
         required=True,
-        help="Directory containing input images (jpg/png).",
-    )
-    parser.add_argument(
-        "--output_dir", type=str, required=True, help="Directory to write all outputs."
-    )
-    parser.add_argument(
-        "--mask_dir",
-        type=str,
-        default=None,
-        help="Optional directory with binary water masks (uint8 PNG, >127 = water). "
-        "Filenames must match image filenames (ignoring extension).",
-    )
-    parser.add_argument(
-        "--conf_threshold",
-        type=float,
-        default=50.0,
-        help="Confidence percentile threshold (0-100). Points below this percentile are "
-        "excluded from the point cloud. Default: 50 (median).",
-    )
-    parser.add_argument(
-        "--use_point_map",
-        action="store_true",
-        help="Use direct point map prediction instead of unprojecting depth. "
-        "The direct point map is natively multi-view consistent (less overlapping), "
-        "while depth unprojection is denser but produces layered per-view points.",
+        help="Directory with the input images (jpg, png or tif)",
     )
     parser.add_argument(
         "--preprocess_mode",
         type=str,
         default="crop",
         choices=["crop", "pad"],
-        help="Image preprocessing mode. 'crop' (default) sets width=518 and center-crops; "
-        "'pad' pads to square 518x518.",
+        help="'crop' resizes to width 518 and center-crops the height if it exceeds "
+        "518, 'pad' pads to 518x518 (default: crop)",
+    )
+
+    # Reconstruction
+    parser.add_argument(
+        "--use_point_map",
+        action="store_true",
+        help="Use the point-map head instead of unprojected depth for "
+        "world_points_NNN.npy and the .ply files, filtered on world_points_conf. "
+        "The point map is consistent across views, while unprojected depth is more "
+        "accurate but overlaps between views",
+    )
+
+    # Point cloud filtering
+    parser.add_argument(
+        "--conf_threshold",
+        type=float,
+        default=50.0,
+        help="Confidence percentile (0-100) for filtering the .ply point clouds, "
+        "not the .npy files (default: 50)",
+    )
+
+    # Water masks
+    parser.add_argument(
+        "--mask_dir",
+        type=str,
+        default=None,
+        help="Directory with water masks named like the images, for "
+        "pointcloud_water.ply and pointcloud_land.ply (optional)",
     )
     parser.add_argument(
         "--mask_threshold",
         type=int,
         default=127,
-        help="Threshold for binary mask (pixel > threshold = water). Default: 127.",
+        help="Mask value above which a pixel counts as water (default: 127)",
     )
+
+    # Output
     parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility."
+        "--output_dir", type=str, required=True, help="Directory for all outputs"
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    if not 0 <= args.conf_threshold <= 100:
+        parser.error(
+            f"--conf_threshold must be in [0, 100], got {args.conf_threshold:g}"
+        )
+    if args.mask_dir is not None and not os.path.isdir(args.mask_dir):
+        parser.error(f"--mask_dir not found: {args.mask_dir}")
+    return args
 
 
-def load_and_resize_masks(mask_dir, image_names, target_h, target_w, threshold=127):
-    masks = []
-    matched = 0
-    for img_name in image_names:
-        stem = Path(img_name).stem
-        mask_path = None
-        for ext in [".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".tif"]:  # Need all exts because some datsets are diffrent...
-            candidate = os.path.join(mask_dir, stem + ext)
-            if os.path.exists(candidate):
-                mask_path = candidate
-                break
-        if mask_path is None:
-            print(f"  [WARN] No mask found for {img_name}, treating as all-land")
-            masks.append(np.zeros((target_h, target_w), dtype=bool))
+def find_images(image_dir):
+    paths = sorted(
+        p
+        for p in glob.glob(os.path.join(glob.escape(image_dir), "*"))
+        if os.path.splitext(p)[1].lower() in IMAGE_EXTENSIONS
+    )
+    if not paths:
+        print(f"ERROR: No images found in {image_dir}")
+        sys.exit(1)
+    return paths
+
+
+def load_masks(mask_dir, image_names, height, width, threshold):
+    """Return (S, H, W) bool water masks matched to the images by filename stem.
+
+    Masks may use a different extension than the images. A view without a mask
+    counts as all land.
+    """
+    mask_paths = {}
+    for path in sorted(glob.glob(os.path.join(glob.escape(mask_dir), "*"))):
+        stem, ext = os.path.splitext(os.path.basename(path))
+        if ext.lower() in IMAGE_EXTENSIONS:
+            mask_paths.setdefault(stem, path)
+
+    masks = np.zeros((len(image_names), height, width), dtype=bool)
+    n_matched = 0
+    for i, name in enumerate(image_names):
+        path = mask_paths.get(os.path.splitext(name)[0])
+        if path is None:
+            print(f"  No mask for {name}, treating it as land")
             continue
+        # nearest keeps the mask binary
+        mask = Image.open(path).convert("L").resize((width, height), Image.NEAREST)
+        masks[i] = np.array(mask) > threshold
+        n_matched += 1
 
-        mask_img = Image.open(mask_path).convert("L")
-        # Nearest-neighbor, should work?
-        mask_img = mask_img.resize((target_w, target_h), Image.NEAREST)
-        mask_arr = np.array(mask_img, dtype=np.uint8)
-        masks.append(mask_arr > threshold)
-        matched += 1
-
-    print(f"  Masks loaded: {matched}/{len(image_names)} matched")
-    return np.stack(masks, axis=0)
-
-
-def save_ply(filepath, points, colors=None):
-    N = points.shape[0]
-    has_color = colors is not None and len(colors) == N
-
-    with open(filepath, "w") as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {N}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        if has_color:
-            f.write("property uchar red\n")
-            f.write("property uchar green\n")
-            f.write("property uchar blue\n")
-        f.write("end_header\n")
-        for i in range(N):
-            line = f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f}"
-            if has_color:
-                line += f" {colors[i, 0]} {colors[i, 1]} {colors[i, 2]}"
-            f.write(line + "\n")
-
-    print(f"  Saved PLY: {filepath} ({N:,} points)")
+    if n_matched == 0:
+        print(f"ERROR: No mask in {mask_dir} matches an image name")
+        sys.exit(1)
+    print(f"  Masks matched: {n_matched}/{len(image_names)}")
+    return masks
 
 
-def save_ply_binary(filepath, points, colors=None):
-    N = points.shape[0]
-    has_color = colors is not None and len(colors) == N
+def save_ply(filepath, points, colors):
+    """Write a binary little-endian PLY with float32 xyz and uint8 rgb."""
+    vertices = np.empty(
+        len(points),
+        dtype=[
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+        ],
+    )
+    for i, field in enumerate(("x", "y", "z")):
+        vertices[field] = points[:, i]
+    for i, field in enumerate(("red", "green", "blue")):
+        vertices[field] = colors[:, i]
 
-    header = "ply\nformat binary_little_endian 1.0\n"
-    header += f"element vertex {N}\n"
-    header += "property float x\nproperty float y\nproperty float z\n"
-    if has_color:
-        header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-    header += "end_header\n"
-
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {len(points)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    )
     with open(filepath, "wb") as f:
         f.write(header.encode("ascii"))
-        if has_color:
-            vertex_dtype = np.dtype(
-                [
-                    ("x", "<f4"),
-                    ("y", "<f4"),
-                    ("z", "<f4"),
-                    ("red", "u1"),
-                    ("green", "u1"),
-                    ("blue", "u1"),
-                ]
-            )
-            vertices = np.empty(N, dtype=vertex_dtype)
-            vertices["x"] = points[:, 0]
-            vertices["y"] = points[:, 1]
-            vertices["z"] = points[:, 2]
-            vertices["red"] = colors[:, 0]
-            vertices["green"] = colors[:, 1]
-            vertices["blue"] = colors[:, 2]
-            vertices.tofile(f)
-        else:
-            points.astype(np.float32).tofile(f)
+        vertices.tofile(f)
+    print(f"  Saved {filepath} ({len(points):,} points)")
 
-    print(f"  Saved PLY: {filepath} ({N:,} points)")
+
+def load_model(device):
+    model = VGGT()
+    state_dict = torch.hub.load_state_dict_from_url(VGGT_WEIGHTS_URL)
+    model.load_state_dict(state_dict)
+    # free the CPU copy of the 5 GB checkpoint before the model moves to the GPU
+    del state_dict
+    gc.collect()
+    model.eval()
+    return model.to(device)
+
+
+def run_inference(model, images, device, dtype):
+    """Run VGGT on preprocessed images of shape (S, 3, H, W).
+
+    :return: dict of per-view numpy arrays, inference time in seconds
+    """
+    images = images.to(device)
+    t0 = time.time()
+    with torch.no_grad(), torch.autocast(device, dtype=dtype, enabled=device == "cuda"):
+        predictions = model(images)
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+        predictions["pose_enc"], images.shape[-2:]
+    )
+    if device == "cuda":
+        # kernels run asynchronously, wait for them before stopping the clock
+        torch.cuda.synchronize()
+    inference_time_s = time.time() - t0
+
+    outputs = {
+        "depth": predictions["depth"].squeeze(0).squeeze(-1),
+        "depth_conf": predictions["depth_conf"].squeeze(0),
+        "world_points": predictions["world_points"].squeeze(0),
+        "world_points_conf": predictions["world_points_conf"].squeeze(0),
+        "extrinsic": extrinsic.squeeze(0),
+        "intrinsic": intrinsic.squeeze(0),
+    }
+    return {k: v.cpu().numpy() for k, v in outputs.items()}, inference_time_s
+
+
+def filter_points(points, conf, depth, percentile):
+    """Select finite points with positive depth and confidence above the percentile.
+
+    :return: boolean mask over all S*H*W pixels, confidence value at the percentile
+    """
+    points = points.reshape(-1, 3)
+    conf = conf.reshape(-1)
+    conf_value = np.percentile(conf, percentile)
+    keep = (
+        (conf >= conf_value)
+        & (depth.reshape(-1) > 1e-4)
+        & np.isfinite(points).all(axis=1)
+        & (np.abs(points) < 1e6).all(axis=1)
+    )
+    return keep, conf_value
+
+
+def format_summary(meta, depth, depth_conf, device, dtype):
+    kept = meta["points_after_filter"]
+    total = meta["total_pixels"]
+    orig_w, orig_h = meta["original_resolution"]
+    vggt_w, vggt_h = meta["vggt_resolution"]
+    if meta["use_point_map"]:
+        source, conf_name = "point map", "world_points_conf"
+    else:
+        source, conf_name = "depth unprojection", "depth_conf"
+
+    lines = [
+        "VGGT inference summary",
+        "=" * 40,
+        f"Images:            {meta['num_images']} from {meta['image_dir']}",
+        f"Original res:      {orig_w} x {orig_h}",
+        f"VGGT res:          {vggt_w} x {vggt_h} ({meta['preprocess_mode']})",
+        f"Point source:      {source}",
+        f"Inference time:    {meta['inference_time_s']:.2f} s on {device} ({dtype})",
+        "",
+        f"Depth range:       [{depth.min():.4f}, {depth.max():.4f}]",
+        f"Depth conf range:  [{depth_conf.min():.4f}, {depth_conf.max():.4f}]",
+        f"Conf threshold:    {meta['conf_threshold_value']:.4f} "
+        f"({meta['conf_threshold_percentile']:g}th percentile of {conf_name})",
+        f"Points kept:       {kept:,} of {total:,} ({100.0 * kept / total:.1f}%)",
+    ]
+    if "water_points" in meta:
+        lines.append(f"Water points:      {meta['water_points']:,}")
+        lines.append(f"Land points:       {meta['land_points']:,}")
+
+    lines += ["", "Camera positions (VGGT world frame, arbitrary scale):"]
+    for i, name in enumerate(meta["image_names"]):
+        x, y, z = meta["camera_positions_world"][i]
+        k = meta["predicted_intrinsics"][f"{i:03d}"]
+        lines.append(
+            f"  [{i:03d}] {name:45s}  pos=({x:8.3f}, {y:8.3f}, {z:8.3f})  "
+            f"fx={k['fx']:.1f} fy={k['fy']:.1f}"
+        )
+    lines += ["", "Georeference with 01_compute_umeyama.py --mode vggt."]
+    return lines
 
 
 def main():
     args = parse_args()
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16
     if device == "cuda":
-        cap = torch.cuda.get_device_capability()
-        if cap[0] < 8:
-            dtype = torch.float16
-        gpu_name = torch.cuda.get_device_name()
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"Device: {device} ({gpu_name}, {gpu_mem:.1f} GB)")
+        # bfloat16 needs compute capability 8.0 (Ampere) or newer
+        major, _ = torch.cuda.get_device_capability()
+        dtype = torch.bfloat16 if major >= 8 else torch.float16
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"Device: {torch.cuda.get_device_name()} ({gpu_mem_gb:.1f} GB)")
     else:
         dtype = torch.float32
-        print(f"Device: {device}")
-    print(f"Dtype for autocast: {dtype}")
+        print("Device: cpu")
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    print("\n=== Loading images ===")  # Search for images, should set global var
-    image_extensions = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".JPG",
-        ".JPEG",
-        ".PNG",
-        ".tif",
-        ".tiff",
-    }
-    image_paths = sorted(
-        [
-            p
-            for p in glob.glob(os.path.join(args.image_dir, "*"))
-            if os.path.splitext(p)[1] in image_extensions
-        ]
-    )
-    if len(image_paths) == 0:
-        raise ValueError(f"No images found in {args.image_dir}")
-
+    print("\n--- Loading images ---")
+    image_paths = find_images(args.image_dir)
     image_names = [os.path.basename(p) for p in image_paths]
-    S = len(image_paths)
-    print(f"Found {S} images in {args.image_dir}")
-    for i, name in enumerate(image_names):
-        print(f"  [{i:03d}] {name}")
-
-    with Image.open(image_paths[0]) as img:
-        orig_w, orig_h = img.size
-    print(f"Original resolution: {orig_w} x {orig_h}")
+    image_sizes = []
+    for p in image_paths:
+        with Image.open(p) as img:
+            image_sizes.append(img.size)
+    orig_w, orig_h = image_sizes[0]
+    if args.mask_dir and (
+        args.preprocess_mode == "pad" or len(set(image_sizes)) > 1 or orig_h > orig_w
+    ):
+        # masks are only resized, while VGGT also crops or pads these images
+        print("ERROR: --mask_dir needs landscape images of one size in crop mode")
+        sys.exit(1)
 
     images = load_and_preprocess_images(image_paths, mode=args.preprocess_mode)
-    # images shape seems to be (S, 3, H_vggt, W_vggt)?
-    vggt_h, vggt_w = images.shape[2], images.shape[3]
-    print(f"Preprocessed shape: {images.shape} (S={S}, H={vggt_h}, W={vggt_w})")
+    S, _, vggt_h, vggt_w = images.shape
+    print(f"{S} images, {orig_w} x {orig_h} -> {vggt_w} x {vggt_h}")
+    masks = None
+    if args.mask_dir:
+        masks = load_masks(
+            args.mask_dir, image_names, vggt_h, vggt_w, args.mask_threshold
+        )
 
-    print("\n=== Loading VGGT model ===")
+    print("\n--- Loading VGGT-1B ---")
     t0 = time.time()
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    state_dict = torch.hub.load_state_dict_from_url(_URL)
-    model.load_state_dict(state_dict)
-    del state_dict  # free CPU memory, learned from Nerfrac
-    import gc
+    model = load_model(device)
+    print(f"Loaded in {time.time() - t0:.1f} s")
 
-    gc.collect()
-
-    model.eval()
-    model = model.to(device)
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    print(f"Model loaded in {time.time() - t0:.1f}s")
-
-    print("\n=== Running inference ===")
-    images_device = images.to(device)
-    t0 = time.time()
-
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images_device)
-
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(
-        predictions["pose_enc"], images_device.shape[-2:]
-    )
-
-    inference_time = time.time() - t0
-    print(f"Inference completed in {inference_time:.2f}s for {S} frames")
-
-    print("\n=== Processing outputs ===")
-
-    # Has batch dimension, need to Remove
-    depth = predictions["depth"].squeeze(0).squeeze(-1).cpu().numpy()
-    depth_conf = predictions["depth_conf"].squeeze(0).cpu().numpy()
-
-    world_points_direct = predictions["world_points"].squeeze(0).cpu().numpy()
-    world_points_conf = predictions["world_points_conf"].squeeze(0).cpu().numpy()
-
-    extrinsic_np = extrinsic.squeeze(0).cpu().numpy()
-    intrinsic_np = intrinsic.squeeze(0).cpu().numpy()
-
-
-    world_points_from_depth = unproject_depth_map_to_point_map(
-        depth[..., np.newaxis],  # needs [S, H, W, 1]
-        extrinsic_np,
-        intrinsic_np,
-    )
-
-    # Need the vggt resolution for coloring point cloud
-    images_np = images.numpy().transpose(0, 2, 3, 1)
-    images_uint8 = (images_np * 255).clip(0, 255).astype(np.uint8)
-
-    print(f"Depth shape: {depth.shape}, range: [{depth.min():.4f}, {depth.max():.4f}]")
-    print(
-        f"Depth conf shape: {depth_conf.shape}, range: [{depth_conf.min():.4f}, {depth_conf.max():.4f}]"
-    )
-    print(f"World points (depth-based) shape: {world_points_from_depth.shape}")
-    print(f"World points (direct) shape: {world_points_direct.shape}")
-
-    # Free GPU memory, or it will crash
-    del predictions, images_device, extrinsic, intrinsic
-    if device == "cuda":
-        torch.cuda.empty_cache()
+    print("\n--- Running inference ---")
+    out, inference_time_s = run_inference(model, images, device, dtype)
+    print(f"{S} views in {inference_time_s:.2f} s ({dtype})")
 
     if args.use_point_map:
-        pts_source = world_points_direct
-        conf_source = world_points_conf
-        print("\n=== Using direct point map for 3D outputs ===")
+        points, points_conf = out["world_points"], out["world_points_conf"]
     else:
-        pts_source = world_points_from_depth
-        conf_source = depth_conf
-        print("\n=== Using depth unprojection for 3D outputs ===")
+        points = unproject_depth_map_to_point_map(
+            out["depth"][..., np.newaxis], out["extrinsic"], out["intrinsic"]
+        )
+        points_conf = out["depth_conf"]
 
-    print("\n=== Saving per-view outputs ===")
+    print("\n--- Saving per-view outputs ---")
+    os.makedirs(args.output_dir, exist_ok=True)
+    # VGGT preprocessing returns floats in [0, 1]
+    rgb = (images.numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
+    per_view = {
+        "depth": out["depth"],
+        "depth_conf": out["depth_conf"],
+        "world_points": points,
+        "world_points_conf": out["world_points_conf"],
+        "extrinsic": out["extrinsic"],
+        "intrinsic": out["intrinsic"],
+    }
     for i in range(S):
-        idx_str = f"{i:03d}"
+        for name, arr in per_view.items():
+            np.save(os.path.join(args.output_dir, f"{name}_{i:03d}.npy"), arr[i])
+        Image.fromarray(rgb[i]).save(os.path.join(args.output_dir, f"rgb_{i:03d}.png"))
+    print(f"  Saved {S} views to {args.output_dir}")
 
-        np.save(os.path.join(args.output_dir, f"depth_{idx_str}.npy"), depth[i])
-        np.save(
-            os.path.join(args.output_dir, f"depth_conf_{idx_str}.npy"), depth_conf[i]
-        )
-        np.save(
-            os.path.join(args.output_dir, f"world_points_conf_{idx_str}.npy"),
-            world_points_conf[i],
-        )
-        np.save(
-            os.path.join(args.output_dir, f"world_points_{idx_str}.npy"),
-            pts_source[i],
-        )
-        np.save(
-            os.path.join(args.output_dir, f"extrinsic_{idx_str}.npy"), extrinsic_np[i]
-        )
-        np.save(
-            os.path.join(args.output_dir, f"intrinsic_{idx_str}.npy"), intrinsic_np[i]
-        )
-
-        # Save preprocessed RGB as PNG
-        rgb_img = Image.fromarray(images_uint8[i])
-        rgb_img.save(os.path.join(args.output_dir, f"rgb_{idx_str}.png"))
-
-    print(f"  Saved {S} sets of per-view files")
-
-    print(f"\n=== Building point cloud (conf threshold: {args.conf_threshold}%) ===")
-
-    all_points = pts_source.reshape(-1, 3)
-    all_conf = conf_source.reshape(-1)
-    all_rgb = images_uint8.reshape(-1, 3)
-    all_depth = depth.reshape(-1)
-
-    view_indices = np.repeat(np.arange(S), vggt_h * vggt_w)
-
-    conf_val = np.percentile(all_conf, args.conf_threshold)
-    conf_mask = (all_conf >= conf_val) & (all_depth > 1e-4)
-
-    valid_mask = np.isfinite(all_points).all(axis=1) & (np.abs(all_points) < 1e6).all(
-        axis=1
+    print("\n--- Building point clouds ---")
+    keep, conf_value = filter_points(
+        points, points_conf, out["depth"], args.conf_threshold
     )
-    combined_mask = conf_mask & valid_mask
-
-    pts_filtered = all_points[combined_mask]
-    rgb_filtered = all_rgb[combined_mask]
-    view_filtered = view_indices[combined_mask]
-
+    kept_pts = points.reshape(-1, 3)[keep]
+    kept_rgb = rgb.reshape(-1, 3)[keep]
     total_pixels = S * vggt_h * vggt_w
-    print(f"  Total pixels: {total_pixels:,}")
     print(
-        f"  Confidence threshold value: {conf_val:.4f} ({args.conf_threshold}th percentile)"
+        f"  Kept {len(kept_pts):,} of {total_pixels:,} points "
+        f"(confidence >= {conf_value:.4f}, {args.conf_threshold:g}th percentile)"
     )
-    print(
-        f"  After conf+valid filter: {pts_filtered.shape[0]:,} points "
-        f"({100.0 * pts_filtered.shape[0] / total_pixels:.1f}%)"
-    )
-
-    #Never used...
-    water_mask_flat = None
-    has_masks = args.mask_dir is not None and os.path.isdir(args.mask_dir)
-
-    if has_masks:
-        print(f"\n=== Loading water masks from {args.mask_dir} ===")
-        water_masks = load_and_resize_masks(
-            args.mask_dir, image_names, vggt_h, vggt_w, threshold=args.mask_threshold
-        )
-        water_mask_flat = water_masks.reshape(-1)[combined_mask]
-
-        n_water = water_mask_flat.sum()
-        n_land = (~water_mask_flat).sum()
-        print(f"  Water points: {n_water:,}")
-        print(f"  Land points:  {n_land:,}")
-
-    print("\n=== Saving point clouds ===")
-
-    save_ply_binary(
-        os.path.join(args.output_dir, "pointcloud_combined.ply"),
-        pts_filtered.astype(np.float32),
-        rgb_filtered,
+    save_ply(
+        os.path.join(args.output_dir, "pointcloud_combined.ply"), kept_pts, kept_rgb
     )
 
-    # Water only
-    if has_masks and water_mask_flat is not None:
-        if water_mask_flat.sum() > 0:
-            save_ply_binary(
-                os.path.join(args.output_dir, "pointcloud_water.ply"),
-                pts_filtered[water_mask_flat].astype(np.float32),
-                rgb_filtered[water_mask_flat],
-            )
-        else:
-            print("  [WARN] No water points found — skipping pointcloud_water.ply")
+    is_water = None
+    if masks is not None:
+        is_water = masks.reshape(-1)[keep]
+        for name, subset in (("water", is_water), ("land", ~is_water)):
+            if subset.any():
+                path = os.path.join(args.output_dir, f"pointcloud_{name}.ply")
+                save_ply(path, kept_pts[subset], kept_rgb[subset])
+            else:
+                print(f"  No {name} points, skipping pointcloud_{name}.ply")
 
-        # Land only
-        if (~water_mask_flat).sum() > 0:
-            save_ply_binary(
-                os.path.join(args.output_dir, "pointcloud_land.ply"),
-                pts_filtered[~water_mask_flat].astype(np.float32),
-                rgb_filtered[~water_mask_flat],
-            )
-        else:
-            print("  [WARN] No land points found — skipping pointcloud_land.ply")
-
-    print("\n=== Saving metadata ===")
-
-    # Need to get the correct camera postions
-    cam_positions = []
-    for i in range(S):
-        R = extrinsic_np[i, :3, :3]
-        t = extrinsic_np[i, :3, 3]
-        # Camera position in world should be -R^T @ t
-        pos = -R.T @ t
-        cam_positions.append(pos.tolist())
-
+    # camera center C = -R^T t (extrinsic is camera-from-world)
+    cam_positions = [(-E[:3, :3].T @ E[:3, 3]).tolist() for E in out["extrinsic"]]
     metadata = {
         "image_dir": os.path.abspath(args.image_dir),
         "output_dir": os.path.abspath(args.output_dir),
@@ -435,97 +401,45 @@ def main():
         "original_resolution": [orig_w, orig_h],
         "vggt_resolution": [vggt_w, vggt_h],
         "preprocess_mode": args.preprocess_mode,
+        "use_point_map": args.use_point_map,
         "conf_threshold_percentile": args.conf_threshold,
-        "conf_threshold_value": float(conf_val),
+        "conf_threshold_value": float(conf_value),
         "mask_threshold": args.mask_threshold,
-        "inference_time_s": round(inference_time, 2),
+        "inference_time_s": round(inference_time_s, 2),
         "total_pixels": total_pixels,
-        "points_after_filter": int(pts_filtered.shape[0]),
+        "points_after_filter": len(kept_pts),
         "coordinate_system": "VGGT world frame (arbitrary, anchored near first camera)",
         "extrinsic_convention": "camera-from-world, OpenCV (x-right, y-down, z-forward)",
         "depth_type": "camera z-depth (not Euclidean ray distance)",
         "camera_positions_world": cam_positions,
         "predicted_intrinsics": {
             f"{i:03d}": {
-                "fx": float(intrinsic_np[i, 0, 0]),
-                "fy": float(intrinsic_np[i, 1, 1]),
-                "cx": float(intrinsic_np[i, 0, 2]),
-                "cy": float(intrinsic_np[i, 1, 2]),
+                "fx": float(K[0, 0]),
+                "fy": float(K[1, 1]),
+                "cx": float(K[0, 2]),
+                "cy": float(K[1, 2]),
             }
-            for i in range(S)
+            for i, K in enumerate(out["intrinsic"])
         },
     }
-
-    if has_masks and water_mask_flat is not None:
-        metadata["water_points"] = int(water_mask_flat.sum())
-        metadata["land_points"] = int((~water_mask_flat).sum())
-
-    with open(os.path.join(args.output_dir, "metadata.json"), "w") as f:
+    if is_water is not None:
+        metadata["water_points"] = int(is_water.sum())
+        metadata["land_points"] = int((~is_water).sum())
+    metadata_path = os.path.join(args.output_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
+    print(f"  Saved {metadata_path}")
 
-    # Prints for Debugging
-    summary_lines = [
-        "VGGT Dense Inference Summary",
-        "=" * 40,
-        f"Images:             {S} from {args.image_dir}",
-        f"Original res:       {orig_w} x {orig_h}",
-        f"VGGT res:           {vggt_w} x {vggt_h}",
-        f"Preprocess mode:    {args.preprocess_mode}",
-        f"Inference time:     {inference_time:.2f}s",
-        f"Device:             {device}",
-        f"Autocast dtype:     {dtype}",
-        "",
-        f"Depth range:        [{depth.min():.4f}, {depth.max():.4f}]",
-        f"Depth conf range:   [{depth_conf.min():.4f}, {depth_conf.max():.4f}]",
-        f"Conf threshold:     {args.conf_threshold}% -> value {conf_val:.4f}",
-        "",
-        f"Total pixels:       {total_pixels:,}",
-        f"Points after filter:{pts_filtered.shape[0]:,} ({100.0 * pts_filtered.shape[0] / total_pixels:.1f}%)",
-    ]
-
-    if has_masks and water_mask_flat is not None:
-        summary_lines += [
-            f"Water points:       {int(water_mask_flat.sum()):,}",
-            f"Land points:        {int((~water_mask_flat).sum()):,}",
-        ]
-
-    summary_lines += [
-        "",
-        "Camera positions (VGGT world frame):",
-    ]
-    for i in range(S):
-        pos = cam_positions[i]
-        fx = intrinsic_np[i, 0, 0]
-        fy = intrinsic_np[i, 1, 1]
-        summary_lines.append(
-            f"  [{i:03d}] {image_names[i]:45s}  "
-            f"pos=({pos[0]:8.3f}, {pos[1]:8.3f}, {pos[2]:8.3f})  "
-            f"fx={fx:.1f} fy={fy:.1f}"
-        )
-
-    summary_lines += [
-        "",
-        "Coordinate system: VGGT arbitrary world frame",
-        "  First camera is approximately at the origin.",
-        "  Scale is self-consistent but not metric.",
-        "  Use Umeyama alignment with known camera GPS positions to georeference.",
-        "",
-        "Per-view files saved:",
-        "  depth_NNN.npy          - camera z-depth [H, W]",
-        "  depth_conf_NNN.npy     - depth confidence [H, W]",
-        "  world_points_conf_NNN.npy - direct point map confidence [H, W]",
-        "  world_points_NNN.npy   - world coords [H, W, 3]  (either direct point_map or unprojected depth)",
-        "  extrinsic_NNN.npy      - camera-from-world [3, 4] (OpenCV convention)",
-        "  intrinsic_NNN.npy      - pinhole intrinsics [3, 3]",
-        "  rgb_NNN.png            - preprocessed input image",
-    ]
-
-    summary_text = "\n".join(summary_lines)
-    with open(os.path.join(args.output_dir, "summary.txt"), "w") as f:
-        f.write(summary_text)
-
-    print(f"\n{summary_text}")
-    print(f"\nAll outputs saved to {args.output_dir}")
+    summary_lines = format_summary(
+        metadata, out["depth"], out["depth_conf"], device, dtype
+    )
+    summary_path = os.path.join(args.output_dir, "summary.txt")
+    with open(summary_path, "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    print(f"  Saved {summary_path}")
+    print()
+    for line in summary_lines:
+        print(line)
 
 
 if __name__ == "__main__":
