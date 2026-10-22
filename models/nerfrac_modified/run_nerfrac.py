@@ -814,11 +814,6 @@ def config_parser():
         help="number of pts sent through network in parallel, decrease if running out of memory",
     )
     parser.add_argument(
-        "--no_batching",
-        action="store_true",
-        help="only take random rays from 1 image at a time",
-    )
-    parser.add_argument(
         "--no_reload", action="store_true", help="do not reload weights from saved ckpt"
     )
     parser.add_argument(
@@ -889,20 +884,6 @@ def config_parser():
     )
     parser.add_argument("--render_all", action="store_true", help="Render all views")
 
-    # training options
-    parser.add_argument(
-        "--precrop_iters",
-        type=int,
-        default=0,
-        help="number of steps to train on central crops",
-    )
-    parser.add_argument(
-        "--precrop_frac",
-        type=float,
-        default=0.5,
-        help="fraction of img taken for central crops",
-    )
-
     # dataset options
     parser.add_argument(
         "--dataset_type",
@@ -910,11 +891,6 @@ def config_parser():
         default="llff",
         choices=["llff"],
         help="only LLFF-format scenes are supported",
-    )
-    parser.add_argument(
-        "--use_mask_selection",
-        action="store_true",
-        help="Use water masks for selective ray sampling during training",
     )
     parser.add_argument(
         "--white_bkgd",
@@ -1087,7 +1063,7 @@ def train():
     writer = SummaryWriter("./tensorboard/" + args.expname)
 
     # Load data
-    images, masks, poses, _, render_poses, _ = load_llff_data(
+    images, masks, poses, _, render_poses, _, c2w_recenter = load_llff_data(
         args.datadir,
         args.factor,
         recenter=True,
@@ -1097,10 +1073,14 @@ def train():
     )
     use_masks = masks is not None
     if use_masks:
-        print(f"Using water masks for ray selection, shape: {masks.shape}")
+        print(f"Using water masks for per-ray water/land routing, shape: {masks.shape}")
         masks = np.transpose(masks, [2, 0, 1])  # [N, H, W]
     else:
-        print("No masks found, training without mask-based ray selection")
+        surface = "water" if args.water == 1 else "land"
+        print(
+            f"No masks_{args.factor} folder in {args.datadir}: "
+            f"every ray is treated as {surface} (--water {args.water})"
+        )
 
     hwf = poses[0, :3, -1]
     poses = poses[:, :3, :4]
@@ -1155,14 +1135,8 @@ def train():
                     file.write(config_file.read())
 
     # Save coordinate system metadata for post-processing scripts
-    # (c2w.npy was overwritten each run by recenter_poses)
-    import shutil
-
     exp_dir = os.path.join(basedir, expname)
-    c2w_src = os.path.join(os.getcwd(), "c2w.npy")
-    c2w_dst = os.path.join(exp_dir, "c2w.npy")
-    if os.path.exists(c2w_src):
-        shutil.copy2(c2w_src, c2w_dst)
+    np.save(os.path.join(exp_dir, "c2w.npy"), c2w_recenter)
     pb = np.load(os.path.join(args.datadir, "poses_bounds.npy"))
     bds_raw = pb[:, -2:]
     sc = 1.0 / (bds_raw.min() * 0.75)
@@ -1262,66 +1236,61 @@ def train():
 
             return
 
-    # Prepare raybatch tensor if batching random rays
+    # Prepare raybatch tensor of random rays
     N_rand = args.N_rand
-    use_batching = not args.no_batching
-    if use_batching:
-        # For random ray batching
-        print("get rays")
-        rays = np.stack(
-            [get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0
-        )  # [N, ro+rd, H, W, 3]
-        print("done, concats")
-        rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
-        # Pre-compute neighbor arrangement for ALL training pixels
-        print("Arranging neighbor rays for all training pixels...")
-        filtered_rays_list = []
-        water_flags_list = []
-        for n in range(len(rays_rgb)):
-            if n not in i_train:
-                continue
-            img_rays = rays_rgb[n]  # [H, W, 3, 3]
-            mask_n = masks[n] if use_masks else np.ones((H, W))
-            padded = np.pad(img_rays, ((1, 1), (1, 1), (0, 0), (0, 0)), mode='edge')
-            # All 9 neighbors via slicing — shape (H, W, 9, 3, 3)
-            neighbors = np.stack([
-                padded[1:H + 1, 1:W + 1],  # 0: center
-                padded[0:H, 0:W],  # 1: top-left
-                padded[0:H, 1:W + 1],  # 2: top
-                padded[0:H, 2:W + 2],  # 3: top-right
-                padded[1:H + 1, 0:W],  # 4: left
-                padded[1:H + 1, 2:W + 2],  # 5: right
-                padded[2:H + 2, 0:W],  # 6: bottom-left
-                padded[2:H + 2, 1:W + 1],  # 7: bottom
-                padded[2:H + 2, 2:W + 2],  # 8: bottom-right
-            ], axis=2)
-            filtered_rays_list.append(neighbors.reshape(-1, 9, 3, 3))
-            water_flags_list.append((mask_n.reshape(-1) > 0.5).astype(np.float32))
-        rays_rgb = np.concatenate(filtered_rays_list, axis=0)  # [N_total, 9, 3, 3]
-        rays_water_flags = np.concatenate(water_flags_list, axis=0)  # [N_total]
-        n_water = int(np.sum(rays_water_flags > 0.5))
-        n_nonwater = len(rays_water_flags) - n_water
-        print(
-            f"Total training rays: {len(rays_rgb)} (water: {n_water}, non-water: {n_nonwater})"
-        )
+    print("get rays")
+    rays = np.stack(
+        [get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0
+    )  # [N, ro+rd, H, W, 3]
+    print("done, concats")
+    rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
+    rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
+    # Pre-compute neighbor arrangement for ALL training pixels
+    print("Arranging neighbor rays for all training pixels...")
+    filtered_rays_list = []
+    water_flags_list = []
+    for n in range(len(rays_rgb)):
+        if n not in i_train:
+            continue
+        img_rays = rays_rgb[n]  # [H, W, 3, 3]
+        # without masks, follow --water like render_rays does
+        mask_n = masks[n] if use_masks else np.full((H, W), float(args.water == 1))
+        padded = np.pad(img_rays, ((1, 1), (1, 1), (0, 0), (0, 0)), mode='edge')
+        # All 9 neighbors via slicing — shape (H, W, 9, 3, 3)
+        neighbors = np.stack([
+            padded[1:H + 1, 1:W + 1],  # 0: center
+            padded[0:H, 0:W],  # 1: top-left
+            padded[0:H, 1:W + 1],  # 2: top
+            padded[0:H, 2:W + 2],  # 3: top-right
+            padded[1:H + 1, 0:W],  # 4: left
+            padded[1:H + 1, 2:W + 2],  # 5: right
+            padded[2:H + 2, 0:W],  # 6: bottom-left
+            padded[2:H + 2, 1:W + 1],  # 7: bottom
+            padded[2:H + 2, 2:W + 2],  # 8: bottom-right
+        ], axis=2)
+        filtered_rays_list.append(neighbors.reshape(-1, 9, 3, 3))
+        water_flags_list.append((mask_n.reshape(-1) > 0.5).astype(np.float32))
+    rays_rgb = np.concatenate(filtered_rays_list, axis=0)  # [N_total, 9, 3, 3]
+    rays_water_flags = np.concatenate(water_flags_list, axis=0)  # [N_total]
+    n_water = int(np.sum(rays_water_flags > 0.5))
+    n_nonwater = len(rays_water_flags) - n_water
+    print(
+        f"Total training rays: {len(rays_rgb)} (water: {n_water}, non-water: {n_nonwater})"
+    )
 
-        rays_rgb = rays_rgb.astype(np.float32)
-        print("shuffle rays")
-        # Shuffle both arrays in sync
-        perm = np.random.permutation(len(rays_rgb))
-        rays_rgb = rays_rgb[perm]
-        rays_water_flags = rays_water_flags[perm]
-        print("done")
-        i_batch = 0
-        
+    rays_rgb = rays_rgb.astype(np.float32)
+    print("shuffle rays")
+    # Shuffle both arrays in sync
+    perm = np.random.permutation(len(rays_rgb))
+    rays_rgb = rays_rgb[perm]
+    rays_water_flags = rays_water_flags[perm]
+    print("done")
+    i_batch = 0
+
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
-    if use_batching:
-        rays_rgb = torch.Tensor(rays_rgb)
-        rays_water_flags = (
-            torch.Tensor(rays_water_flags)
-        )
+    rays_rgb = torch.Tensor(rays_rgb)
+    rays_water_flags = torch.Tensor(rays_water_flags)
     poses = torch.Tensor(poses).to(device)
 
     N_iters = args.N_iter + 1
@@ -1332,115 +1301,22 @@ def train():
 
     start = start + 1
     for i in trange(start, N_iters):
-        batch_wm = None  # per-ray water mask
+        # Sample a random ray batch over all images
+        batch = rays_rgb[i_batch : i_batch + N_rand].to(device)  # [B, 9, 2+1, 3*?]
+        batch_wm = rays_water_flags[i_batch: i_batch + N_rand].to(device)  # [B]
+        batch = torch.reshape(batch, [-1, 3, 3])
+        batch = torch.transpose(batch, 0, 1)
+        batch_rays, target_s = batch[:2], batch[2]
 
-        # Sample random ray batch
-        if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch : i_batch + N_rand].to(device)  # [B, 9, 2+1, 3*?]
-            batch_wm = rays_water_flags[i_batch: i_batch + N_rand].to(device)  # [B]
-            batch = torch.reshape(batch, [-1, 3, 3])
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
-
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                rays_water_flags = rays_water_flags[rand_idx]
-                i_batch = 0
-
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = images[img_i]
-            target = torch.Tensor(target).to(device)
-            pose = poses[img_i, :3, :4]
-
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(
-                    H, W, K, torch.Tensor(pose)
-                )  # (H, W, 3), (H, W, 3)
-
-                if i < args.precrop_iters:
-                    dH = int(H // 2 * args.precrop_frac)
-                    dW = int(W // 2 * args.precrop_frac)
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(H // 2 - dH, H // 2 + dH - 1, 2 * dH),
-                            torch.linspace(W // 2 - dW, W // 2 + dW - 1, 2 * dW),
-                        ),
-                        -1,
-                    )
-                    if i == start:
-                        print(
-                            f"[Config] Center cropping of size {2 * dH} x {2 * dW} is enabled until iter {args.precrop_iters}"
-                        )
-                else:
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)
-                        ),
-                        -1,
-                    )  # (H, W, 2)
-
-                coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
-
-                # --- Mask-based ray selection ---
-                if use_masks and args.use_mask_selection:
-                    current_mask = masks[img_i]  # (H, W)
-                    mask_flat = current_mask.reshape(-1)  # (H * W,)
-                    water_indices = np.where(mask_flat > 0.5)[0]
-                    non_water_indices = np.where(mask_flat <= 0.5)[0]
-
-                    # Sample from both water and non-water pixels
-                    n_water_avail = len(water_indices)
-                    n_nonwater_avail = len(non_water_indices)
-                    # Use all water pixels up to N_rand, fill rest with non-water
-                    n_water_sample = min(n_water_avail, N_rand)
-                    n_nonwater_sample = N_rand - n_water_sample
-
-                    w_inds = np.random.choice(
-                        water_indices, size=n_water_sample, replace=False
-                    )
-                    if n_nonwater_sample > 0 and n_nonwater_avail > 0:
-                        nw_inds = np.random.choice(
-                            non_water_indices,
-                            size=min(n_nonwater_sample, n_nonwater_avail),
-                            replace=False,
-                        )
-                        select_inds = np.concatenate([w_inds, nw_inds])
-                    else:
-                        select_inds = w_inds
-
-                    np.random.shuffle(select_inds)
-                    # Build per-ray water mask for selected pixels
-                    batch_wm = torch.tensor(
-                        (mask_flat[select_inds] > 0.5).astype(np.float32),
-                        device=device,
-                    )
-                else:
-                    select_inds = np.random.choice(
-                        coords.shape[0], size=[N_rand], replace=False
-                    )
-                    # No mask info: fall back to scene-level water flag (backup)
-                    batch_wm = None
-                # --- END Mask-based ray selection ---
-
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
-
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-
-                batch_rays = torch.stack([rays_o, rays_d], 0)
-                target_s = target[
-                    select_coords[:, 0], select_coords[:, 1]
-                ]  # (N_rand, 3)
+        i_batch += N_rand
+        if i_batch >= rays_rgb.shape[0]:
+            print("Shuffle data after an epoch!")
+            rand_idx = torch.randperm(rays_rgb.shape[0])
+            rays_rgb = rays_rgb[rand_idx]
+            rays_water_flags = rays_water_flags[rand_idx]
+            i_batch = 0
 
         #####  Core optimization loop  #####
-        # batch_wm is set by both use_batching and no_batching paths;
-        # it may be None when no masks are available.
         rgb, _, _, Xs, _, _, extras = render(
             H,
             W,

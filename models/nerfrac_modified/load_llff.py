@@ -183,14 +183,13 @@ def recenter_poses(poses):
     c2w = poses_avg(poses)
     c2w = np.concatenate([c2w[:3, :4], bottom], -2)
     print('c2w:::::::::::::::::::::::::::::', c2w)
-    np.save('c2w.npy', c2w[:3, :4])
     bottom = np.tile(np.reshape(bottom, [1, 1, 4]), [poses.shape[0], 1, 1])
     poses = np.concatenate([poses[:, :3, :4], bottom], -2)
 
     poses = np.linalg.inv(c2w) @ poses
     poses_[:, :3, :4] = poses[:, :3, :4]
     poses = poses_
-    return poses
+    return poses, c2w[:3, :4]
 
 
 #####################
@@ -300,8 +299,10 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     if load_masks:
         masks = _load_masks(basedir, factor=factor)
         if masks is not None and masks.shape[-1] != imgs.shape[-1]:
-            print(f'Warning: Number of masks ({masks.shape[-1]}) != number of images ({imgs.shape[-1]})')
-            masks = None
+            raise ValueError(f'{masks.shape[-1]} masks for {imgs.shape[-1]} images in {basedir}')
+        if masks is not None and masks.shape[:2] != imgs.shape[:2]:
+            raise ValueError(f'Masks are {masks.shape[1]}x{masks.shape[0]} px but images are '
+                             f'{imgs.shape[1]}x{imgs.shape[0]} px in {basedir}')
 
     # Correct rotation matrix ordering and move variable dim to axis 0
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
@@ -315,8 +316,9 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     poses[:, :3, 3] *= sc
     bds *= sc
 
+    c2w_recenter = None
     if recenter:
-        poses = recenter_poses(poses)
+        poses, c2w_recenter = recenter_poses(poses)
 
     if spherify:
         poses, render_poses, bds = spherify_poses(poses, bds)
@@ -368,4 +370,4 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     images = images.astype(np.float32)
     poses = poses.astype(np.float32)
 
-    return images, masks, poses, bds, render_poses, i_test
+    return images, masks, poses, bds, render_poses, i_test, c2w_recenter

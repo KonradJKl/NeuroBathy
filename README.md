@@ -180,8 +180,8 @@ Download the drone images (folder 09, a 23.8 GiB archive) from the
 the along-river flight (`20241025_Pielach-1-along`). [LLFF](https://github.com/Fyusion/LLFF)'s
 `imgs2poses.py` runs COLMAP and writes `sparse/0/` and `poses_bounds.npy` into the scene
 folder. The masks are generated from the downsized images, so create those first.
-Without masks, or with a different number of masks than images, NeRFrac treats every
-pixel as water and only prints a warning.
+If the masks differ from the images in number or size, `run_nerfrac.py` stops. Without a
+`masks_<factor>` folder it treats every pixel as water, as upstream NeRFrac does.
 
 ```bash
 conda activate neurobathy

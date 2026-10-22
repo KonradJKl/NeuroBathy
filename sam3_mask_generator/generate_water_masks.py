@@ -270,8 +270,8 @@ def main():
             mask_name = os.path.splitext(name)[0] + ".png"
             Image.fromarray(binary_mask).save(os.path.join(args.output_dir, mask_name))
         except Exception:
-            # load_llff.py drops all masks and 07_make_pointcloud.py pairs them by
-            # position if one is missing, so record it and exit 1 after the loop
+            # load_llff.py refuses a scene with a missing mask and 07_make_pointcloud.py
+            # pairs masks by position, so record it and exit 1 after the loop
             failed.append(name)
             tqdm.write(f"  {name}: failed\n{traceback.format_exc()}")
         finally:

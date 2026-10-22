@@ -21,11 +21,10 @@ Changes made for shallow-water bathymetry from drone imagery:
   with a NaN or Inf loss are skipped, the refractive offset is clamped to
   [-1, 1] and the Snell's-law radicand is clamped (no NaN under total internal
   reflection).
-- Optional water-first ray sampling (`--use_mask_selection`, with `--no_batching`).
 - Expected depth, mode depth (sample with the highest weight) and accumulated
   opacity are saved for every rendered view; upstream saved only the RGB image
   and the surface points.
-- `c2w.npy`, which upstream writes to the working directory, is copied into each
+- `c2w.npy`, which upstream writes to the working directory, is saved into each
   experiment folder next to a new `llff_scale.npy`, so the postprocessing can
   map renders back to COLMAP and UTM coordinates.
 - Vectorized 3x3 neighbour-ray gathering (border pixels use edge replication
