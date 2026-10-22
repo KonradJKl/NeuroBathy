@@ -519,12 +519,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
                 
                 psnrout = psnr(gt_img, out_img)
 
-                # --- SSIM is broken --- //TODO
-                try:
-                    ssimout = ssim(gt_img, out_img)
-                except Exception as e:
-                    print(f"[warn] SSIM disabled this step: {e}")
-                    ssimout = 0.0
+                ssimout = ssim(gt_img, out_img)
                 
                 mse = 10 ** (-psnrout / 10)
                 average = mse * np.sqrt(1 - ssimout) * lpipsout
@@ -628,7 +623,7 @@ def create_nerf(args):
         ckpts = [
             os.path.join(basedir, expname, f)
             for f in sorted(os.listdir(os.path.join(basedir, expname)))
-            if "tar" in f
+            if f.endswith(".tar")
         ]
 
     print("Found ckpts", ckpts)
@@ -778,8 +773,9 @@ def config_parser():
     parser.add_argument(
         "--nerf_type",
         type=str,
-        default="original",
-        help="nerf network type, original or nerof",
+        default="nerfrac",
+        choices=["nerfrac"],
+        help="network type (only nerfrac is implemented)",
     )
     parser.add_argument(
         "--N_iter", type=int, default=200000, help="num training iterations"
@@ -967,7 +963,10 @@ def config_parser():
     parser.add_argument("--water", type=int, default=1, help="with water surface")
     parser.add_argument("--initdepth", type=float, default=-0.6, help="initial depth")
     parser.add_argument(
-        "--tframe", type=str, default=4, help="test frame, 4 is the center camera"
+        "--tframe",
+        type=str,
+        default="4",
+        help="comma-separated indices of the test views",
     )
 
     parser.add_argument(
@@ -1320,13 +1319,13 @@ def train():
         i_batch = 0
         
     # Move training data to GPU
-    images = torch.Tensor(images).pin_memory().to(device, non_blocking=True)
+    images = torch.Tensor(images).to(device)
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb)
         rays_water_flags = (
             torch.Tensor(rays_water_flags)
         )
-    poses = torch.Tensor(poses).pin_memory().to(device, non_blocking=True)
+    poses = torch.Tensor(poses).to(device)
 
     N_iters = args.N_iter + 1
     print("Begin")
@@ -1551,8 +1550,9 @@ def train():
                     device=device,
                 )
                 loss = loss + effective_consist_weight * consistency_loss
-            except Exception as e:
-                tqdm.write(f"[WARN] Consistency loss failed at iter {i}: {e}")
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                tqdm.write(f"Iter {i:,}: consistency loss skipped (CUDA out of memory)")
 
         # --- TensorBoard logging ---
         writer.add_scalar("loss_smooth", smooth_loss, global_step=i)
