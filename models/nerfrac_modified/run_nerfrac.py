@@ -406,11 +406,13 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         H = H // render_factor
         W = W // render_factor
         focal = focal / render_factor
+        K = np.array([[focal, 0, 0.5 * W], [0, focal, 0.5 * H], [0, 0, 1]])
 
     rgbs = []
     disps = []
 
     t = time.time()
+    metrics = []
     if gt_imgs is not None:
         lpips_model = util_of_lpips(net="vgg")
 
@@ -525,19 +527,14 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
                 average = mse * np.sqrt(1 - ssimout) * lpipsout
                 average = math.pow(average, 1.0 / 3)
 
-                dic = {
-                    "PSNR": psnrout,
-                    "SSIM": ssimout,
-                    "LPIPS": lpipsout,
-                    "average": average,
-                }
-                df = pd.DataFrame([dic])
-                df.to_csv(
-                    os.path.join(savedir, "result.txt"),
-                    sep="\t",
-                    index=False,
-                    float_format="%.3f",
+                metrics.append(
+                    {"PSNR": psnrout, "SSIM": ssimout, "LPIPS": lpipsout, "average": average}
                 )
+
+    if metrics:
+        pd.DataFrame(metrics).to_csv(
+            os.path.join(savedir, "result.txt"), sep="\t", index=False, float_format="%.3f"
+        )
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
@@ -1141,13 +1138,15 @@ def train():
     expname = args.expname
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-    f = os.path.join(basedir, expname, "args.txt")
+    # render-only runs keep the training record in args.txt and config.txt
+    args_file = "args_render.txt" if args.render_only else "args.txt"
+    f = os.path.join(basedir, expname, args_file)
 
     with open(f, "w") as file:
         for arg in sorted(vars(args)):
             attr = getattr(args, arg)
             file.write("{} = {}\n".format(arg, attr))
-    if args.config is not None:
+    if args.config is not None and not args.render_only:
         dest_config = os.path.join(basedir, expname, "config.txt")
         src_config = os.path.abspath(args.config)
         if os.path.abspath(dest_config) != src_config:
@@ -1191,30 +1190,27 @@ def train():
         with torch.no_grad():
             if args.render_test:
                 # render_test switches to test poses
-                render_idx = i_test
+                mode = "test"
                 images = images[i_test]
                 render_masks = masks[i_test] if use_masks else None
             elif args.render_train:
-                render_idx = i_train
+                mode = "train"
                 images = images[i_train]
                 render_masks = masks[i_train] if use_masks else None
             elif args.render_all:
-                render_idx = i_comp
+                mode = "all"
                 images = images[i_comp]
                 render_masks = masks[i_comp] if use_masks else None
 
             else:
-                # Default is smoother render_poses path
-                render_idx = i_train
-                images = images[i_train]
-                render_masks = masks[i_train] if use_masks else None
+                # Default is smoother render_poses path, without ground truth or masks
+                mode = "path"
+                images = None
+                render_masks = None
 
+            # start is the global_step stored in the checkpoint, one less than its iteration
             testsavedir = os.path.join(
-                basedir,
-                expname,
-                "renderonly_{}_{:06d}".format(
-                    "test" if args.render_test else "path", start
-                ),
+                basedir, expname, f"renderonly_{mode}_{start + 1:06d}"
             )
             os.makedirs(testsavedir, exist_ok=True)
             print("test poses shape", render_poses.shape)
@@ -1240,28 +1236,29 @@ def train():
             except Exception as e:
                 print("[WARN] Could not write video with imageio/ffmpeg backend:", e)
 
-            print(f"Generating error maps for {len(rgbs)} frames...")
-            for k in range(len(rgbs)):
-                pred = torch.tensor(rgbs[k])
-                gt = torch.tensor(images[k])
-                err_map = torch.sum((pred - gt) ** 2, dim=-1).cpu().numpy()
-                err_map_colored = (colorize_np(err_map, range=(0.0, 1.0)) * 255).astype(
-                    np.uint8
-                )
-                imageio.imwrite(
-                    os.path.join(testsavedir, "{:03d}_err.png".format(k)),
-                    err_map_colored,
-                )
-                if use_masks and args.use_mask_selection:
-                    mask = masks[render_idx[k]]
-                    masked_err = err_map * mask
-                    err_map_masked_colored = (
-                        colorize_np(masked_err, range=(0.0, 1.0)) * 255
-                    ).astype(np.uint8)
-                    imageio.imwrite(
-                        os.path.join(testsavedir, "{:03d}_err_masked.png".format(k)),
-                        err_map_masked_colored,
+            # the ground truth is full size, so a reduced render gets no error maps
+            if images is not None and args.render_factor == 0:
+                print(f"Generating error maps for {len(rgbs)} frames...")
+                for k in range(len(rgbs)):
+                    pred = torch.tensor(rgbs[k])
+                    gt = torch.tensor(images[k])
+                    err_map = torch.sum((pred - gt) ** 2, dim=-1).cpu().numpy()
+                    err_map_colored = (colorize_np(err_map, range=(0.0, 1.0)) * 255).astype(
+                        np.uint8
                     )
+                    imageio.imwrite(
+                        os.path.join(testsavedir, "{:03d}_err.png".format(k)),
+                        err_map_colored,
+                    )
+                    if render_masks is not None:
+                        masked_err = err_map * render_masks[k]
+                        err_map_masked_colored = (
+                            colorize_np(masked_err, range=(0.0, 1.0)) * 255
+                        ).astype(np.uint8)
+                        imageio.imwrite(
+                            os.path.join(testsavedir, "{:03d}_err_masked.png".format(k)),
+                            err_map_masked_colored,
+                        )
 
             return
 

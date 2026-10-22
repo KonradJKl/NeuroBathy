@@ -217,9 +217,9 @@ python run_nerfrac.py --config configs/pielach.txt --render_only --render_all
 
 The experiment name is built from the config values, so the renders (RGB, mean and mode
 depth, opacity and water surface points per view) go into
-`logs/pielach_nerfrac_d-0.4_yita1.333_tframe4_factor4multires2_4_64/renderonly_path_199999/`.
-The 199999 is the step stored in the last checkpoint (`200000.tar`). Georeference the
-renders, extract the depth below the WSM and validate:
+`logs/pielach_nerfrac_d-0.4_yita1.333_tframe4_factor4multires2_4_64/renderonly_all_200000/`,
+named after the render mode and the checkpoint. Georeference the renders, extract the
+depth below the WSM and validate:
 
 ```bash
 cd ../../postprocessing
@@ -233,7 +233,7 @@ python 01_compute_umeyama.py --mode nerfrac \
     --output transforms/pielach_umeyama.npz
 
 python 02_extract_bathymetry.py --mode nerfrac \
-    --testset_dir $log/renderonly_path_199999 \
+    --testset_dir $log/renderonly_all_200000 \
     --log_folder $log \
     --data_dir $scene \
     --umeyama_npz transforms/pielach_umeyama.npz \
