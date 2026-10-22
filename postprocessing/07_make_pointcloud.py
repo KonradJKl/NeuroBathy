@@ -12,12 +12,13 @@ Usage (VGGT):
 Usage (NeRFrac):
     python 07_make_pointcloud.py \\
         --mode nerfrac \\
-        --log_folder logs/pielach_sep_nerfrac_... \\
-        --testset testset_all_600000 \\
-        --poses_bounds data/nerf_llff_data/pielach_data/poses_bounds.npy \\
+        --log_folder /path/to/experiment_log \\
+        --testset renderonly_all_600000 \\
+        --poses_bounds /path/to/pielach_data/poses_bounds.npy \\
         --factor 4 \\
+        --data_dir /path/to/pielach_data \\
         --umeyama_npz ../data/transforms/nerfrac_nadir_umeyama.npz \\
-        --mask_dir data/nerf_llff_data/pielach_data/masks_4 \\
+        --mask_dir /path/to/pielach_data/masks_4 \\
         --output_dir pointclouds/nerfrac_f4
 """
 
@@ -53,6 +54,17 @@ def filter_outliers(points, colors, percentile=1.0):
         mask &= (vals >= lo) & (vals <= hi)
     removed = np.sum(~mask)
     return points[mask], colors[mask], removed
+
+def list_masks(mask_dir, n_views):
+    if not os.path.isdir(mask_dir):
+        print(f"[ERROR] Mask directory not found: {mask_dir}")
+        sys.exit(1)
+    mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+    if len(mask_files) != n_views:
+        print(f"[ERROR] {len(mask_files)} masks in {mask_dir} for {n_views} views")
+        sys.exit(1)
+    return mask_files
+
 
 def _vggt_view_indices(vggt_dir):
     return [v["index"] for v in discover_vggt_views(vggt_dir)]
@@ -90,6 +102,8 @@ def generate_vggt_pointcloud(args):
         print(f"Loaded Umeyama (scale={umeyama['scale']:.4f}) from {args.umeyama_npz}")
 
     has_masks = bool(args.mask_dir)
+    if has_masks:
+        list_masks(args.mask_dir, len(view_indices))
     all_pts = []
     all_rgb = []
     all_water_pts = []
@@ -323,7 +337,7 @@ def fit_water_surface_plane(all_surface_points, max_points=50000):
         return None, None, None
 
     if N > max_points:
-        idx = np.random.choice(N, max_points, replace=False)
+        idx = np.random.default_rng(42).choice(N, max_points, replace=False)
         pts = all_surface_points[idx]
     else:
         pts = all_surface_points
@@ -381,16 +395,7 @@ def align_water_surfaces(per_view_data, normal, d):
 
 
 def _load_nerfrac_masks(mask_dir, n_views, H, W):
-    import glob
-
-    if not mask_dir or not os.path.isdir(mask_dir):
-        return None
-
-    mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
-    if not mask_files:
-        print(f"[WARN] No mask PNGs in {mask_dir}")
-        return None
-
+    mask_files = list_masks(mask_dir, n_views)
     masks = []
     for i in range(min(len(mask_files), n_views)):
         m = imageio.imread(mask_files[i])
@@ -619,39 +624,6 @@ def generate_nerfrac_pointcloud(args):
 
 
 
-def _apply_water_mask(
-    valid_mask, mask_dir, view_idx, n_views, H, W, water_only=False, land_only=False
-):
-    if not water_only and not land_only:
-        return None
-
-    import glob
-
-    mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
-    if not mask_files:
-        return None
-
-    if view_idx >= len(mask_files):
-        print(f"  [WARN] No mask for view {view_idx} (only {len(mask_files)} masks)")
-        return None
-
-    m = imageio.imread(mask_files[view_idx])
-    if m.ndim == 3:
-        m = m[:, :, 0]
-    if m.shape[0] != H or m.shape[1] != W:
-        import cv2
-
-        m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-
-    water_bool = m > 127
-    if water_only:
-        return valid_mask & water_bool
-    elif land_only:
-        return valid_mask & ~water_bool
-    return None
-
-
-
 def save_preview(points, colors, output_dir, label=""):
     """Save a matplotlib 3D scatter preview."""
     import matplotlib
@@ -764,17 +736,8 @@ def parse_args():
         "--mask_dir",
         type=str,
         default="",
-        help="Directory with water mask PNGs (used with --water_only or --land_only)",
-    )
-    p.add_argument(
-        "--water_only",
-        action="store_true",
-        help="Keep only water pixels (requires --mask_dir)",
-    )
-    p.add_argument(
-        "--land_only",
-        action="store_true",
-        help="Keep only land pixels (requires --mask_dir)",
+        help="Directory with water mask PNGs, paired with the views by sorted file "
+        "name; adds separate water and land point clouds",
     )
     p.add_argument(
         "--no_filter",
@@ -795,11 +758,11 @@ def parse_args():
     p.add_argument(
         "--depth_type",
         type=str,
-        default="mean",
+        default="mode",
         choices=["mean", "mode"],
         help="[nerfrac] Which depth map to use. "
-        "'mean' (default): weighted average depth (*_depth.npy). "
-        "'mode': peak of weight distribution (*_depth_mode.npy).",
+        "'mode': peak of weight distribution (*_depth_mode.npy). "
+        "'mean': weighted average depth (*_depth.npy).",
     )
 
     return p.parse_args()
@@ -825,10 +788,6 @@ def main():
         if not args.poses_bounds:
             print("[ERROR] --poses_bounds is required for NeRFrac mode")
             sys.exit(1)
-
-    if args.water_only and args.land_only:
-        print("[ERROR] Cannot use --water_only and --land_only together")
-        sys.exit(1)
 
     if args.output_dir:
         output_dir = args.output_dir
@@ -860,10 +819,7 @@ def main():
             print(f"Mask dir:         {args.mask_dir} (water/land separation)")
             print(f"WS alignment:     {'off' if args.no_align else 'on'}")
         else:
-            filter_label = (
-                "water" if args.water_only else ("land" if args.land_only else "none")
-            )
-            print(f"Mask dir:         {args.mask_dir} (filter: {filter_label})")
+            print(f"Mask dir:         {args.mask_dir} (water/land separation)")
     print()
 
     extra = {}
