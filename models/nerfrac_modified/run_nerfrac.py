@@ -2,7 +2,6 @@ import os
 import numpy as np
 import imageio
 import random
-import time
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm, trange
@@ -182,29 +181,6 @@ def compute_consistency_loss(
     valid_bounds_ba = (u_a >= 0) & (u_a < W) & (v_a >= 0) & (v_a < H)
     valid_ba = valid_front_ba & valid_bounds_ba
 
-    # Debug logging
-    n_front_ab = int(valid_front_ab.sum().item())
-    n_bounds_ab = int(valid_bounds_ab.sum().item())
-    n_valid_ab = int(valid_ab.sum().item())
-    n_front_ba = int(valid_front_ba.sum().item())
-    n_bounds_ba = int(valid_bounds_ba.sum().item())
-    n_valid_ba = int(valid_ba.sum().item())
-    tqdm.write(
-        f"[CONSIST] views=({idx_a},{idx_b}) water_px=({n_a},{n_b}) "
-        f"front_ab={n_front_ab} bounds_ab={n_bounds_ab} valid_ab={n_valid_ab} | "
-        f"front_ba={n_front_ba} bounds_ba={n_bounds_ba} valid_ba={n_valid_ba}"
-    )
-    with torch.no_grad():
-        tqdm.write(
-            f"[CONSIST]   P_world_a: mean={P_world_a.mean(0).tolist()}, "
-            f"std={P_world_a.std(0).tolist()}"
-        )
-        if n_valid_ab > 0:
-            tqdm.write(
-                f"[CONSIST]   proj A->B u: [{u_b[valid_front_ab].min():.1f}, {u_b[valid_front_ab].max():.1f}] "
-                f"v: [{v_b[valid_front_ab].min():.1f}, {v_b[valid_front_ab].max():.1f}]"
-            )
-
     # Match projected pixels to nearest rendered pixels, compute loss
     max_pixel_dist = 15.0
     loss = torch.tensor(0.0, device=device)
@@ -219,11 +195,6 @@ def compute_consistency_loss(
         dists_ab = torch.cdist(proj_ab, coords_b_float)  # (N_v, n_b)
         nn_dist_ab, nn_idx_ab = dists_ab.min(dim=1)  # (N_v,)
         close_ab = nn_dist_ab < max_pixel_dist
-        tqdm.write(
-            f"[CONSIST]   A->B nn_dist: min={nn_dist_ab.min():.1f} "
-            f"median={nn_dist_ab.median():.1f} max={nn_dist_ab.max():.1f} "
-            f"close={int(close_ab.sum().item())}"
-        )
 
         if close_ab.sum() > 0:
             matched_P_b = P_world_b[nn_idx_ab[close_ab]]
@@ -238,11 +209,6 @@ def compute_consistency_loss(
         dists_ba = torch.cdist(proj_ba, coords_a_float)
         nn_dist_ba, nn_idx_ba = dists_ba.min(dim=1)
         close_ba = nn_dist_ba < max_pixel_dist
-        tqdm.write(
-            f"[CONSIST]   B->A nn_dist: min={nn_dist_ba.min():.1f} "
-            f"median={nn_dist_ba.median():.1f} max={nn_dist_ba.max():.1f} "
-            f"close={int(close_ba.sum().item())}"
-        )
 
         if close_ba.sum() > 0:
             matched_P_a = P_world_a[nn_idx_ba[close_ba]]
@@ -250,7 +216,6 @@ def compute_consistency_loss(
             loss = loss + torch.mean((source_P_b - matched_P_a) ** 2)
             n_pairs += int(close_ba.sum().item())
 
-    tqdm.write(f"[CONSIST]   => n_pairs={n_pairs}, loss={loss.item():.6f}")
     return loss, n_pairs
 
 
@@ -411,15 +376,11 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     rgbs = []
     disps = []
 
-    t = time.time()
     metrics = []
     if gt_imgs is not None:
         lpips_model = util_of_lpips(net="vgg")
 
     for i, c2w in enumerate(tqdm(render_poses)):
-        print(i, time.time() - t)
-        t = time.time()
-
         # Build per-pixel water mask for this image
         pwm = None
         if masks is not None and i < len(masks):
@@ -461,8 +422,6 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         rgb = torch.reshape(rgb, [H, W, 3])
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
-        if i == 0:
-            print(rgb.shape, disp.shape)
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -552,7 +511,6 @@ def create_nerf(args):
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
-    print("input_ch:", args.N_importance)
     model = NeRF.get_by_name(
         args.nerf_type,
         D=args.netdepth,
@@ -623,7 +581,6 @@ def create_nerf(args):
             if f.endswith(".tar")
         ]
 
-    print("Found ckpts", ckpts)
     if len(ckpts) > 0 and not args.no_reload:
         ckpt_path = ckpts[-1]
         print("Reloading from", ckpt_path)
@@ -1208,7 +1165,7 @@ def train():
                     quality=8,
                 )
             except Exception as e:
-                print("[WARN] Could not write video with imageio/ffmpeg backend:", e)
+                print(f"Could not write video.mp4: {e}")
 
             # the ground truth is full size, so a reduced render gets no error maps
             if images is not None and args.render_factor == 0:
@@ -1275,7 +1232,7 @@ def train():
     n_water = int(np.sum(rays_water_flags > 0.5))
     n_nonwater = len(rays_water_flags) - n_water
     print(
-        f"Total training rays: {len(rays_rgb)} (water: {n_water}, non-water: {n_nonwater})"
+        f"Total training rays: {len(rays_rgb):,} (water: {n_water:,}, non-water: {n_nonwater:,})"
     )
 
     rays_rgb = rays_rgb.astype(np.float32)
@@ -1310,7 +1267,7 @@ def train():
 
         i_batch += N_rand
         if i_batch >= rays_rgb.shape[0]:
-            print("Shuffle data after an epoch!")
+            tqdm.write("Shuffle data after an epoch!")
             rand_idx = torch.randperm(rays_rgb.shape[0])
             rays_rgb = rays_rgb[rand_idx]
             rays_water_flags = rays_water_flags[rand_idx]
@@ -1461,10 +1418,8 @@ def train():
             writer.add_scalar("loss/flatness", flat_loss.item(), global_step=i)
             writer.add_scalar("flatness/effective_weight", effective_flat_weight, global_step=i)
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(
-                f"[WARN] Iter {i}: NaN/Inf loss detected ({loss.item():.4f}), skipping batch"
-            )
+        if not torch.isfinite(loss):
+            tqdm.write(f"Iter {i:,}: non-finite loss ({loss.item():.4f}), batch skipped")
             optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
@@ -1495,7 +1450,7 @@ def train():
                 },
                 path,
             )
-            print("Saved checkpoints at", path)
+            tqdm.write(f"Saved checkpoints at {path}")
 
         if i % args.i_video == 0 and i > 0:
             # Turn on testing mode
@@ -1503,7 +1458,7 @@ def train():
                 rgbs, disps = render_path(
                     render_poses, hwf, K, args.chunk, render_kwargs_test, args=args
                 )
-            print("Done, saving", rgbs.shape, disps.shape)
+            tqdm.write(f"Done, saving {rgbs.shape} {disps.shape}")
             moviebase = os.path.join(
                 basedir, expname, "{}_spiral_{:06d}_".format(expname, i)
             )
@@ -1513,7 +1468,7 @@ def train():
             testsavedir = os.path.join(basedir, expname, "testset_{:06d}".format(i))
             os.makedirs(testsavedir, exist_ok=True)
             test_masks = masks[i_test] if use_masks else None
-            print("test poses shape", poses[i_test].shape)
+            tqdm.write(f"test poses shape {poses[i_test].shape}")
             with torch.no_grad():
                 render_path(
                     torch.Tensor(poses[i_test]).to(device),
@@ -1526,12 +1481,12 @@ def train():
                     args=args,
                     masks=test_masks,
                 )
-            print("Saved test set")
+            tqdm.write("Saved test set")
 
         if i % args.i_print == 0:
             dD_info = ""
             if args.water == 1:
-                dD_info = f" dD_mean: {dD_out.abs().mean().item():.6f} dD_max: {dD_out.abs().max().item():.4f}"
+                dD_info = f"  dD mean {dD_out.abs().mean().item():.6f} max {dD_out.abs().max().item():.4f}"
             smooth_val = (
                 smooth_loss.item()
                 if isinstance(smooth_loss, torch.Tensor)
@@ -1544,10 +1499,10 @@ def train():
                     if isinstance(consistency_loss, torch.Tensor)
                     else consistency_loss
                 )
-                consist_info = f" Consist: {consist_val:.6f} ({n_consist_pairs}p)"
+                consist_info = f"  consistency {consist_val:.6f} ({n_consist_pairs:,} pairs)"
             tqdm.write(
-                f"[TRAIN] Iter: {i} Loss: {loss.item():.6f} PSNR: {psnr.item():.3f} "
-                f"Smooth: {smooth_val:.6f}{dD_info}{consist_info}"
+                f"Iter {i:,}  loss {loss.item():.6f}  psnr {psnr.item():.3f}  "
+                f"smooth {smooth_val:.6f}{dD_info}{consist_info}"
             )
 
         global_step += 1
