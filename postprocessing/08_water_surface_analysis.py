@@ -2,13 +2,14 @@
 Analyze NeRFrac's predicted water surface (Xs points) against a ground truth
 Usage:
     python 08_water_surface_analysis.py \\
-        --log_folder logs/pielach_sep_nerfrac_d-0.4_... \\
-        --testset testset_all_600000 \\
-        --poses_bounds data/nerf_llff_data/pielach_data/poses_bounds.npy \\
+        --log_folder /path/to/experiment_log \\
+        --testset renderonly_all_600000 \\
+        --poses_bounds /path/to/pielach_data/poses_bounds.npy \\
         --factor 4 \\
-        --wsm_path '/path/to/Pielach_20241024_WSM.tif' \\
+        --mask_dir /path/to/pielach_data/masks_4 \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --umeyama_npz ../data/transforms/nerfrac_nadir_umeyama.npz \\
-        --output_dir ./water_surface/f4 \\
+        --output_dir water_surface/f4 \\
         --label 'NeRFrac f4'
 """
 
@@ -27,6 +28,7 @@ from coord_utils import (
     load_umeyama,
     NEAR,
     ndc_to_colmap,
+    nerf_world_to_colmap,
     sample_wsm_batch,
 )
 
@@ -37,7 +39,7 @@ def _load_masks_sorted(mask_dir, H, W):
 
     mask_files = sorted(
         [f for f in os.listdir(mask_dir)
-         if f.endswith(('.png', '.jpg', '.npy'))]
+         if f.endswith(".png")]
     )
 
     masks = []
@@ -68,8 +70,8 @@ def load_xs_all_views(testset_dir, H, W, focal, coord_meta, umeyama,
         masks = _load_masks_sorted(mask_dir, H, W)
         print(f"  Using water masks from: {mask_dir} ({len(masks)} masks)")
         if len(masks) != len(xs_files):
-            print(f"  [WARN] {len(masks)} masks but {len(xs_files)} Xs files — "
-                  f"mask/view count mismatch!")
+            print(f"[ERROR] {len(masks)} masks in {mask_dir} for {len(xs_files)} views")
+            sys.exit(1)
     else:
         print("  [WARN] No --mask_dir provided. Including ALL pixels with "
               "Z_ndc > -0.999. Land pixels may have meaningless Xs values!")
@@ -169,7 +171,7 @@ def compute_error_stats(dz, label=""):
 
 def fit_plane_svd(points, max_pts=50000):
     if len(points) > max_pts:
-        idx = np.random.choice(len(points), size=max_pts, replace=False)
+        idx = np.random.default_rng(42).choice(len(points), size=max_pts, replace=False)
         sample = points[idx]
     else:
         sample = points
@@ -407,7 +409,7 @@ def plot_spatial_error_map(points_utm, dz, output_path):
 
     max_plot = 200000
     if len(pts) > max_plot:
-        idx = np.random.choice(len(pts), size=max_plot, replace=False)
+        idx = np.random.default_rng(42).choice(len(pts), size=max_plot, replace=False)
         pts = pts[idx]
         vals = vals[idx]
 
@@ -555,7 +557,7 @@ def plot_per_view(dz, view_ids, n_views, output_path):
         if mask.sum() > 0:
             d = dz[mask]
             if len(d) > 10000:
-                d = np.random.choice(d, 10000, replace=False)
+                d = np.random.default_rng(42).choice(d, 10000, replace=False)
             boxdata.append(d)
             boxlabels.append(str(v))
     bp = ax3.boxplot(
@@ -607,7 +609,7 @@ def plot_unified_3d(points_utm, n_views, label, output_path):
 
     max_3d = 50000
     if len(grid_e) > max_3d:
-        idx3 = np.random.choice(len(grid_e), size=max_3d, replace=False)
+        idx3 = np.random.default_rng(42).choice(len(grid_e), size=max_3d, replace=False)
         grid_e, grid_n, grid_z = grid_e[idx3], grid_n[idx3], grid_z[idx3]
 
     fig = plt.figure(figsize=(14, 10))
@@ -672,7 +674,7 @@ def plot_profiles(points_utm, dz, wsm_path, output_path):
 
     max_plot = 50000
     idx = (
-        np.random.choice(len(pts), size=max_plot, replace=False)
+        np.random.default_rng(42).choice(len(pts), size=max_plot, replace=False)
         if len(pts) > max_plot
         else np.arange(len(pts))
     )
@@ -1034,8 +1036,7 @@ def plot_camera_positions(
 
         cam_nerf = pose[:3, 3].copy()
 
-        cam_colmap = np.linalg.inv(c2w_recenter[:3, :3]) @ cam_nerf
-        cam_colmap = cam_colmap / sc
+        cam_colmap = nerf_world_to_colmap(cam_nerf, c2w_recenter, sc)
         cam_utm = apply_umeyama(cam_colmap, s_um, R_um, t_um)
 
         ax.scatter(
@@ -1180,6 +1181,9 @@ def save_results(
             )
 
         f.write(f"\nTILT / SLOPE COMPARISON\n")
+        f.write("  NeRFrac: plane through a 50,000-point sample of the matched Xs "
+                "points. WSM: mean gradient of the raster.\n")
+        f.write("  Directions point uphill, in degrees counter-clockwise from east.\n")
         f.write(f"  {'':>25} {'GT WSM':>15} {'NeRFrac':>15}\n")
         f.write(f"  {'-' * 55}\n")
         f.write(
@@ -1206,6 +1210,21 @@ def save_results(
             f"  Normal: [{nerfrac_normal[0]:.6f}, "
             f"{nerfrac_normal[1]:.6f}, {nerfrac_normal[2]:.6f}]\n\n"
         )
+
+        if gridded_metrics is not None:
+            gm = gridded_metrics
+            f.write("GRIDDED WATER SURFACE (median Z per cell, dZ = cell Z - cell WSM)\n")
+            f.write(f"  Cells:            {gm['n_cells']:,}\n")
+            f.write(f"  Bias:             {gm['gridded_bias']:+.3f} m\n")
+            f.write(f"  RMSE:             {gm['gridded_rmse']:.3f} m\n")
+            f.write(f"  MAE:              {gm['gridded_mae']:.3f} m\n")
+            f.write(f"  Gridded tilt:     {gm['gridded_tilt']:.2f} deg from horizontal "
+                    f"(plane through the cell medians)\n")
+            f.write(f"  Within 0.5/1/2 m: {gm['within_05m']:.1f}% / "
+                    f"{gm['within_1m']:.1f}% / {gm['within_2m']:.1f}%\n")
+            f.write(f"  View consistency: {gm['view_consistency_mean']:.3f} m mean, "
+                    f"{gm['view_consistency_median']:.3f} m median Z std "
+                    f"({gm['n_multiview_cells']:,} cells seen by 2+ views)\n\n")
 
         f.write(f"ELEVATION RANGES\n")
         f.write(
@@ -1262,7 +1281,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default=None,
-        help="Output directory (default: auto-named in postprocessing/)",
+        help="Output directory (default: water_surface/<label>)",
     )
     parser.add_argument(
         "--label",
@@ -1311,11 +1330,11 @@ def main():
         print(f"[ERROR] Umeyama .npz not found: {args.umeyama_npz}")
         sys.exit(1)
 
-    label = args.label or os.path.basename(args.log_folder)
+    label = args.label or os.path.basename(os.path.normpath(args.log_folder))
     output_dir = args.output_dir
     if output_dir is None:
         safe_label = label.replace("/", "_").replace(" ", "_")
-        output_dir = os.path.join("postprocessing", "water_surface", safe_label)
+        output_dir = os.path.join("water_surface", safe_label)
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 80)
@@ -1347,10 +1366,9 @@ def main():
                 )
                 H = H_actual
             elif H_actual * W != n_pixels:
-                print(
-                    f"  [WARN] First Xs file has {n_pixels} pixels, "
-                    f"not divisible by W={W}"
-                )
+                print(f"[ERROR] {n_pixels} rendered pixels do not fit W={W}, "
+                      f"check --factor")
+                sys.exit(1)
         except Exception:
             pass
 
@@ -1403,7 +1421,8 @@ def main():
     resid = np.dot(points_utm[matched], normal) + d
     resid_std = float(np.std(resid))
     print(f"  Plane residual std: {resid_std:.4f} m")
-    print(f"  Tilt: {nerfrac_grad['tilt_from_horizontal_deg']:.4f} deg")
+    print(f"  Plane tilt: {nerfrac_grad['tilt_from_horizontal_deg']:.4f} deg "
+          f"(plane through a 50,000-point sample of the matched points)")
 
     wsm_grad = compute_wsm_gradient(args.wsm_path)
     print(f"  WSM tilt: {wsm_grad['tilt_from_horizontal_deg']:.4f} deg")
