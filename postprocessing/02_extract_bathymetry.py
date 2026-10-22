@@ -5,11 +5,12 @@ Usage examples:
     # NeRFrac 50m
     python 02_extract_bathymetry.py \\
         --mode nerfrac \\
-        --testset_dir /path/to/testset_all_950000 \\
+        --testset_dir /path/to/experiment_log/renderonly_all_950000 \\
         --log_folder /path/to/experiment_log \\
+        --data_dir /path/to/pielach_50m \\
         --umeyama_npz ../data/transforms/nerfrac_50m_umeyama.npz \\
-        --mask_dir /path/to/masks_8 \\
-        --wsm_path /path/to/WSM.tif \\
+        --mask_dir /path/to/pielach_50m/masks_8 \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --output_csv bathymetry/bathymetry_nerfrac_50m.csv
 
     # VGGT 50m
@@ -17,8 +18,8 @@ Usage examples:
         --mode vggt \\
         --vggt_dir /path/to/vggt_output \\
         --umeyama_npz ../data/transforms/vggt_50m_v1_umeyama.npz \\
-        --mask_dir /path/to/masks_8 \\
-        --wsm_path /path/to/WSM.tif \\
+        --mask_dir /path/to/pielach_50m/masks_8 \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --output_csv bathymetry/bathymetry_vggt_50m.csv
 """
 
@@ -127,7 +128,8 @@ def parse_args():
         "--mask_dir",
         type=str,
         default="",
-        help="Path to binary water masks directory (optional but recommended)",
+        help="Path to binary water masks directory (optional but recommended). "
+        "The masks are paired with the views by sorted file name.",
     )
     parser.add_argument(
         "--grid_resolution",
@@ -145,7 +147,8 @@ def parse_args():
         "--depth_max",
         type=float,
         default=5.0,
-        help="Maximum valid depth in meters (default 5.0 — reject extreme outliers)",
+        help="Maximum valid depth in meters (default 5.0). Raise it, e.g. to 50, for "
+        "models that overpredict depth and need 11_scale_correction.py",
     )
     parser.add_argument(
         "--output_csv",
@@ -190,11 +193,11 @@ def parse_args():
     parser.add_argument(
         "--depth_type",
         type=str,
-        default="mean",
+        default="mode",
         choices=["mean", "mode"],
         help="[nerfrac] Which depth map to use. "
-        "'mean' (default): weighted average depth (*_depth.npy). "
-        "'mode': peak of weight distribution (*_depth_mode.npy).",
+        "'mode' (default, used for the thesis results): peak of weight distribution "
+        "(*_depth_mode.npy). 'mean': weighted average depth (*_depth.npy).",
     )
 
     # PLY point cloud -> for debugging
@@ -216,39 +219,36 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_mask(mask_dir, view_idx, H, W):
+def list_masks(mask_dir, n_views):
     if not mask_dir:
         return None
+    if not os.path.isdir(mask_dir):
+        print(f"ERROR: Mask directory not found: {mask_dir}")
+        sys.exit(1)
+    mask_files = sorted(f for f in os.listdir(mask_dir) if f.endswith(".png"))
+    if len(mask_files) != n_views:
+        print(f"ERROR: {len(mask_files)} masks in {mask_dir} for {n_views} views")
+        sys.exit(1)
+    return [os.path.join(mask_dir, f) for f in mask_files]
 
-    candidates = [
-        os.path.join(mask_dir, f"{view_idx:03d}.png"),
-        os.path.join(mask_dir, f"mask_{view_idx:03d}.png"),
-    ]
-    if os.path.isdir(mask_dir):
-        mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith(".png")])
-        if view_idx < len(mask_files):
-            candidates.append(os.path.join(mask_dir, mask_files[view_idx]))
 
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                import imageio
+def load_mask(mask_files, view_idx, H, W):
+    if mask_files is None:
+        return None
 
-                mask = imageio.imread(path)
-                if mask.ndim == 3:
-                    mask = mask[:, :, 0]
+    import imageio
 
-                if mask.shape != (H, W):
-                    from PIL import Image as PILImage
+    mask = imageio.imread(mask_files[view_idx])
+    if mask.ndim == 3:
+        mask = mask[:, :, 0]
 
-                    mask_pil = PILImage.fromarray(mask)
-                    mask_pil = mask_pil.resize((W, H), PILImage.NEAREST)
-                    mask = np.array(mask_pil)
-                return mask > WATER_MASK_THRESHOLD
-            except Exception:
-                continue
+    if mask.shape != (H, W):
+        from PIL import Image as PILImage
 
-    return None
+        mask_pil = PILImage.fromarray(mask)
+        mask_pil = mask_pil.resize((W, H), PILImage.NEAREST)
+        mask = np.array(mask_pil)
+    return mask > WATER_MASK_THRESHOLD
 
 
 def extract_nerfrac_view(
@@ -353,7 +353,7 @@ def extract_nerfrac_views_plane_fit(
     umeyama_scale,
     R,
     t,
-    mask_dir,
+    mask_files,
     wsm_path,
     depth_min,
     depth_max,
@@ -372,7 +372,7 @@ def extract_nerfrac_views_plane_fit(
         if xs_ndc.shape[0] != expected_n:
             continue
 
-        mask = load_mask(mask_dir, vi, H, W)
+        mask = load_mask(mask_files, vi, H, W)
         if mask is not None:
             mask_flat = mask.reshape(-1)
         else:
@@ -433,7 +433,7 @@ def extract_nerfrac_views_plane_fit(
         if xs_ndc_probe.shape[0] != expected_n:
             continue
 
-        mask_probe = load_mask(mask_dir, vi, H, W)
+        mask_probe = load_mask(mask_files, vi, H, W)
         if mask_probe is not None:
             water_idx_probe = np.where(mask_probe.reshape(-1))[0]
         else:
@@ -506,7 +506,7 @@ def extract_nerfrac_views_plane_fit(
 
         depth_flat = depth_map.reshape(-1, 1)
 
-        mask = load_mask(mask_dir, vi, H, W)
+        mask = load_mask(mask_files, vi, H, W)
         if mask is not None:
             mask_flat = mask.reshape(-1)
         else:
@@ -855,11 +855,16 @@ def _run_nerfrac(args, s, R, t):
         sys.exit(1)
     print(f"LLFF scale: sc={sc:.8f}  (1/sc={1.0 / sc:.4f})")
 
+    views = discover_nerfrac_views(args.testset_dir, args.depth_type)
+    if not views:
+        print(f"ERROR: No NeRFrac views found in {args.testset_dir}")
+        sys.exit(1)
+    mask_files = list_masks(args.mask_dir, len(views))
+
     # Get focal
     H, W, focal = args.H, args.W, args.focal
     if H == 0 or W == 0 or focal == 0.0:
-        views = discover_nerfrac_views(args.testset_dir, args.depth_type)
-        if views and views[0]["depth"] is not None:
+        if views[0]["depth"] is not None:
             d0 = np.load(views[0]["depth"])
             H_auto, W_auto = d0.shape
             if H == 0:
@@ -881,8 +886,6 @@ def _run_nerfrac(args, s, R, t):
                     )
                     sys.exit(1)
             print(f"Resolution: H={H}, W={W}, focal={focal:.4f}")
-    else:
-        views = discover_nerfrac_views(args.testset_dir, args.depth_type)
 
     print(
         f"\n--- Step 2: Process {len(views)} views (depth_method={args.depth_method}, depth_type={args.depth_type}) ---"
@@ -900,12 +903,15 @@ def _run_nerfrac(args, s, R, t):
             s,
             R,
             t,
-            args.mask_dir,
+            mask_files,
             args.wsm_path,
             args.depth_min,
             args.depth_max,
             return_depth_maps=want_maps,
         )
+        if pf_result[0] is None:
+            print("\nERROR: No valid points extracted from any view")
+            sys.exit(1)
         if want_maps:
             all_points, all_depths, all_wsm_elevs, n_views, n_skipped, depth_maps = (
                 pf_result
@@ -913,9 +919,6 @@ def _run_nerfrac(args, s, R, t):
         else:
             all_points, all_depths, all_wsm_elevs, n_views, n_skipped = pf_result
             depth_maps = []
-
-        if all_points is None:
-            all_points, all_depths, all_wsm_elevs = [], [], []
 
         if args.per_view_png and depth_maps:
             _save_per_view_pngs(args, depth_maps)
@@ -929,7 +932,7 @@ def _run_nerfrac(args, s, R, t):
         n_skipped = 0
 
         for vi, view in enumerate(views):
-            mask = load_mask(args.mask_dir, vi, H, W)
+            mask = load_mask(mask_files, vi, H, W)
 
             result = extract_nerfrac_view(
                 view,
@@ -973,7 +976,7 @@ def _run_nerfrac(args, s, R, t):
 
 
 def _calibrate_z_offset_vggt(
-    views, s, R, t, mask_dir, wsm_path, n_calib_views, surface_percentile
+    views, s, R, t, mask_files, wsm_path, n_calib_views, surface_percentile
 ):
 
     n_use = min(n_calib_views, len(views))
@@ -987,7 +990,7 @@ def _calibrate_z_offset_vggt(
 
         valid = np.all(np.isfinite(pts), axis=1) & np.any(pts != 0.0, axis=1)
 
-        mask = load_mask(mask_dir, vi, H_v, W_v)
+        mask = load_mask(mask_files, vi, H_v, W_v)
         if mask is not None:
             if mask.shape != (H_v, W_v):
                 from PIL import Image as PILImage
@@ -1058,6 +1061,7 @@ def _run_vggt(args, s, R, t):
         print("ERROR: No VGGT views found")
         sys.exit(1)
 
+    mask_files = list_masks(args.mask_dir, len(views))
     wp0 = np.load(views[0]["world_points"])
     H_v, W_v = wp0.shape[:2]
     del wp0
@@ -1070,7 +1074,7 @@ def _run_vggt(args, s, R, t):
             s,
             R,
             t,
-            args.mask_dir,
+            mask_files,
             args.wsm_path,
             args.z_calib_views,
             args.z_surface_percentile,
@@ -1085,7 +1089,7 @@ def _run_vggt(args, s, R, t):
     n_skipped = 0
 
     for vi, view in enumerate(views):
-        mask = load_mask(args.mask_dir, vi, H_v, W_v)
+        mask = load_mask(mask_files, vi, H_v, W_v)
 
         result = extract_vggt_view(
             view,
@@ -1216,7 +1220,7 @@ def _finalize(args, all_points, all_depths, all_wsm_elevs, n_views, n_skipped):
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
     save_csv(rows, args.output_csv)
 
-    raw_path = args.output_csv.replace(".csv", "_raw.npz")
+    raw_path = os.path.splitext(args.output_csv)[0] + "_raw.npz"
     np.savez_compressed(
         raw_path,
         utm_points=all_points,
@@ -1226,7 +1230,7 @@ def _finalize(args, all_points, all_depths, all_wsm_elevs, n_views, n_skipped):
     print(f"Saved {len(all_points)} raw points to {raw_path}")
 
     if args.output_ply:
-        ply_path = args.output_csv.replace(".csv", "_combined.ply")
+        ply_path = os.path.splitext(args.output_csv)[0] + "_combined.ply"
         write_ply_with_depth(ply_path, all_points, all_depths)
 
 
