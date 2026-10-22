@@ -4,9 +4,9 @@
 Usage:
     python 14_control_point_validation.py \\
         --comparison_csv validation/<model>/comparison.csv \\
-        --control_csv /path/to/control_points.csv \\
+        --control_csv ../data/gt/pielach/06_control_points/Pielach_2024102_control_points.csv \\
         --pointcloud_npy pointclouds/<model>/pointcloud_combined.npy \\
-        --wsm_path /path/to/WSM.tif \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --bathymetry_csv bathymetry/<model>.csv \\
         --output_dir validation/<model>/control_point_analysis/ \\
         --max_dist 0.5 \\
@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -23,6 +24,10 @@ from scipy.spatial import cKDTree
 
 from coord_utils import compute_metrics, sample_wsm_batch
 
+
+
+def natural_key(name):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(name))]
 
 
 def log(msg):
@@ -40,6 +45,7 @@ def load_control_points(path):
         "Code": "code",
     }
     df = df.rename(columns=rename)
+    df["name"] = df["name"].astype(str)
     df["elevation"] = pd.to_numeric(
         df["elevation"].astype(str).str.replace(r"[^\d.\-]", "", regex=True),
         errors="coerce",
@@ -356,7 +362,7 @@ def main():
     ]
 
     txt_lines = []
-    txt_lines.append(f"CONTROL POINT VALIDATION — {args.label}")
+    txt_lines.append(f"CONTROL POINT VALIDATION: {args.label}")
     txt_lines.append(f"Scale factor: {scale_factor:.4f}")
     txt_lines.append(f"Max match distance: {args.max_dist}m")
     txt_lines.append(f"Control points matched: {n_matched}/{n_total}")
@@ -416,7 +422,7 @@ def main():
             f"{'N pts':>6s}"
         )
         txt_lines.append("-" * 72)
-        for _, r in ctrl_m.sort_values("name").iterrows():
+        for _, r in ctrl_m.sort_values("name", key=lambda s: s.map(natural_key)).iterrows():
             txt_lines.append(
                 f"{r['name']:<12s} "
                 f"{fmt(r['gt_elevation'])} {fmt(r['pred_elevation'])} "
@@ -519,8 +525,14 @@ def main():
         trn_df = matched[
             matched["transect"].notna() & (matched["transect"] != "")
         ].copy()
-        transect_names = sorted(trn_df["transect"].unique())
-        n_trans = len(transect_names)
+        trn_df["run"] = (trn_df["transect"] != trn_df["transect"].shift()).cumsum()
+        panels = []
+        for tname in sorted(trn_df["transect"].unique(), key=natural_key):
+            runs = trn_df.loc[trn_df["transect"] == tname, "run"].unique()
+            for k, run in enumerate(runs, 1):
+                title = tname if len(runs) == 1 else f"{tname} ({k}/{len(runs)})"
+                panels.append((title, trn_df[trn_df["run"] == run]))
+        n_trans = len(panels)
 
         if n_trans > 0:
             ncols = min(4, n_trans)
@@ -529,11 +541,10 @@ def main():
                 nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False
             )
 
-            for idx, tname in enumerate(transect_names):
+            for idx, (tname, sub) in enumerate(panels):
                 row, col = idx // ncols, idx % ncols
                 ax = axes[row, col]
 
-                sub = trn_df[trn_df["transect"] == tname].copy()
                 eas = sub["gt_easting"].values
                 nor = sub["gt_northing"].values
                 seg_dist = np.sqrt(np.diff(eas) ** 2 + np.diff(nor) ** 2)
@@ -641,7 +652,7 @@ def main():
                     ax = axes[row, col]
 
                     sub = ctrl_pts[ctrl_pts["group"] == gname].copy()
-                    sub = sub.sort_values("name")
+                    sub = sub.sort_values("name", key=lambda s: s.map(natural_key))
                     eas = sub["gt_easting"].values
                     nor = sub["gt_northing"].values
 
@@ -865,7 +876,10 @@ def main():
         with open(src_ply_path, "rb") as f:
             header_lines = []
             while True:
-                line = f.readline().decode("ascii", errors="replace").strip()
+                raw_line = f.readline()
+                if not raw_line:
+                    raise ValueError(f"No end_header in {src_ply_path}")
+                line = raw_line.decode("ascii", errors="replace").strip()
                 header_lines.append(line)
                 if line == "end_header":
                     break
