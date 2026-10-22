@@ -1,6 +1,10 @@
 """
-Analyze NeRFrac's predicted water surface (Xs points) against a ground truth
-Usage:
+Compare NeRFrac's learned water surface (Xs points) with the surveyed water surface
+model (WSM).
+
+Writes ws_analysis_stats.json, ws_analysis_summary.txt and the plots to --output_dir.
+
+Usage example:
     python 08_water_surface_analysis.py \\
         --log_folder /path/to/experiment_log \\
         --testset renderonly_all_600000 \\
@@ -20,139 +24,167 @@ import os
 import sys
 
 import numpy as np
+import rasterio
+from PIL import Image
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 
 from coord_utils import (
+    NEAR,
+    WATER_MASK_THRESHOLD,
     apply_umeyama,
     load_focal_from_poses_bounds,
     load_nerfrac_coord_metadata,
     load_umeyama,
-    NEAR,
     ndc_to_colmap,
     nerf_world_to_colmap,
     sample_wsm_batch,
 )
 
+# Land rays carry their origin on the NDC near plane (z = -1) as Xs
+NDC_NEAR_PLANE_Z = -0.999
+GRID_CELL_M = 0.1
+PLANE_FIT_POINTS = 50000
 
 
-def _load_masks_sorted(mask_dir, H, W):
-    from PIL import Image
-
-    mask_files = sorted(
-        [f for f in os.listdir(mask_dir)
-         if f.endswith(".png")]
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare NeRFrac's water surface (Xs) with the surveyed WSM."
     )
+    parser.add_argument(
+        "--log_folder",
+        type=str,
+        required=True,
+        help="experiment folder with c2w.npy and llff_scale.npy",
+    )
+    parser.add_argument(
+        "--testset",
+        type=str,
+        required=True,
+        help="render folder inside --log_folder with the Xs_pts*.npy files, e.g. "
+        "renderonly_all_600000",
+    )
+    parser.add_argument(
+        "--poses_bounds",
+        type=str,
+        required=True,
+        help="poses_bounds.npy of the scene, for the image size and focal",
+    )
+    parser.add_argument(
+        "--factor",
+        type=int,
+        required=True,
+        help="image downsample factor of the training",
+    )
+    parser.add_argument(
+        "--wsm_path",
+        type=str,
+        required=True,
+        help="water surface model GeoTIFF",
+    )
+    parser.add_argument(
+        "--umeyama_npz",
+        type=str,
+        required=True,
+        help="transform from 01_compute_umeyama.py",
+    )
+    parser.add_argument(
+        "--mask_dir",
+        type=str,
+        default=None,
+        help="water masks (PNG), paired with the views by sorted file name. "
+        "Without them, every pixel whose Xs is off the near plane counts as water",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="scene folder, to recompute the scene scale without llff_scale.npy",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="output folder (default: water_surface/<label>)",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default=None,
+        help="model name for the plots and the summary (default: the log folder name)",
+    )
+    parser.add_argument(
+        "--skip_multiview",
+        action="store_true",
+        help="skip the multiview_3d, multiview_analysis and cameras plots",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="gridded quality plot with two panels, without the metrics text",
+    )
+    return parser.parse_args()
 
+
+def load_masks(mask_dir, n_views, H, W):
+    if not os.path.isdir(mask_dir):
+        print(f"ERROR: Mask directory not found: {mask_dir}")
+        sys.exit(1)
+    names = sorted(f for f in os.listdir(mask_dir) if f.endswith(".png"))
+    if len(names) != n_views:
+        print(f"ERROR: {len(names)} masks in {mask_dir} for {n_views} views")
+        sys.exit(1)
     masks = []
-    for mf in mask_files:
-        p = os.path.join(mask_dir, mf)
-        if p.endswith(".npy"):
-            mask = np.load(p)
-        else:
-            mask = np.array(Image.open(p).convert("L"))
-        if mask.shape[0] != H or mask.shape[1] != W:
-            mask = np.array(
-                Image.fromarray(mask).resize((W, H), Image.NEAREST)
-            )
-        masks.append(mask.flatten() > 127)
-
+    for name in names:
+        mask = np.array(Image.open(os.path.join(mask_dir, name)).convert("L"))
+        if mask.shape != (H, W):
+            mask = np.array(Image.fromarray(mask).resize((W, H), Image.NEAREST))
+        masks.append(mask.flatten() > WATER_MASK_THRESHOLD)
     return masks
 
 
-def load_xs_all_views(testset_dir, H, W, focal, coord_meta, umeyama,
-                      mask_dir=None):
-    xs_files = sorted(glob.glob(os.path.join(testset_dir, "Xs_pts*.npy")))
-    if not xs_files:
-        print(f"[ERROR] No Xs_pts*.npy files found in {testset_dir}")
-        sys.exit(1)
-
-    masks = None
+def load_water_surface(xs_files, H, W, focal, coord_meta, umeyama, mask_dir):
+    """UTM Xs points of the water pixels of all views, and the view of each point."""
+    masks = [None] * len(xs_files)
     if mask_dir:
-        masks = _load_masks_sorted(mask_dir, H, W)
-        print(f"  Using water masks from: {mask_dir} ({len(masks)} masks)")
-        if len(masks) != len(xs_files):
-            print(f"[ERROR] {len(masks)} masks in {mask_dir} for {len(xs_files)} views")
-            sys.exit(1)
+        masks = load_masks(mask_dir, len(xs_files), H, W)
     else:
-        print("  [WARN] No --mask_dir provided. Including ALL pixels with "
-              "Z_ndc > -0.999. Land pixels may have meaningless Xs values!")
+        print("No --mask_dir: every pixel with Xs off the near plane counts as water")
 
-    c2w_recenter = coord_meta["c2w_recenter"]
-    sc = coord_meta["sc"]
-    s = umeyama["scale"]
-    R = umeyama["rotation"]
-    t = umeyama["translation"]
-
-    all_colmap = []
-    all_utm = []
-    all_view_ids = []
-    per_view_counts = []
-
-    for i, xs_file in enumerate(xs_files):
-        xs_ndc = np.load(xs_file).reshape(-1, 3)
-        n_total = len(xs_ndc)
-        ndc_mask = xs_ndc[:, 2] > -0.999
-
-        if masks is not None and i < len(masks):
-            water_mask = masks[i]
-            combined_mask = ndc_mask & water_mask
-        else:
-            combined_mask = ndc_mask
-            water_mask = None
-
-        xs_water = xs_ndc[combined_mask]
-        n_water = xs_water.shape[0]
-        per_view_counts.append(n_water)
-
-        n_ndc = ndc_mask.sum()
-        if water_mask is not None:
-            print(
-                f"  View {i}: {n_water:,} water-masked pixels "
-                f"(NDC: {n_ndc:,}, mask: {water_mask.sum():,}) "
-                f"out of {n_total:,}"
-            )
-        else:
-            print(
-                f"  View {i}: {n_water:,} water pixels "
-                f"({100 * n_water / n_total:.1f}%) out of {n_total:,}"
-            )
-
-        if n_water == 0:
+    s, R, t = umeyama["scale"], umeyama["rotation"], umeyama["translation"]
+    points_utm, view_ids = [], []
+    for i, (xs_file, mask) in enumerate(zip(xs_files, masks)):
+        xs = np.load(xs_file).reshape(-1, 3)
+        water = xs[:, 2] > NDC_NEAR_PLANE_Z
+        if mask is not None:
+            water &= mask
+        xs_water = xs[water]
+        print(f"  View {i}: {len(xs_water):,} water pixels of {len(xs):,}")
+        if len(xs_water) == 0:
             continue
-
-        pts_colmap = ndc_to_colmap(xs_water, H, W, focal, c2w_recenter, sc, NEAR)
-        pts_utm = apply_umeyama(pts_colmap, s, R, t)
-
-        all_colmap.append(pts_colmap)
-        all_utm.append(pts_utm)
-        all_view_ids.append(np.full(n_water, i, dtype=int))
-
-    if not all_utm:
-        print("[ERROR] No water pixels found in any view!")
+        colmap = ndc_to_colmap(
+            xs_water, H, W, focal, coord_meta["c2w_recenter"], coord_meta["sc"], NEAR
+        )
+        points_utm.append(apply_umeyama(colmap, s, R, t))
+        view_ids.append(np.full(len(xs_water), i, dtype=int))
+    if not points_utm:
+        print("ERROR: No water pixels in any view")
         sys.exit(1)
 
-    points_colmap = np.vstack(all_colmap)
-    points_utm = np.vstack(all_utm)
-    view_ids = np.concatenate(all_view_ids)
-
-    print(
-        f"\nTotal: {len(points_utm):,} water surface points from {len(xs_files)} views"
-    )
-
-    return {
-        "points_utm": points_utm,
-        "points_colmap": points_colmap,
-        "view_ids": view_ids,
-        "n_views": len(xs_files),
-        "per_view_counts": per_view_counts,
-    }
+    points_utm = np.vstack(points_utm)
+    print(f"{len(points_utm):,} water surface points from {len(xs_files)} views")
+    return points_utm, np.concatenate(view_ids)
 
 
-def compute_error_stats(dz, label=""):
+def error_stats(dz, label=""):
     valid = ~np.isnan(dz)
     n = valid.sum()
     if n == 0:
         return {"n": 0, "label": label}
-
     d = dz[valid]
     return {
         "label": label,
@@ -169,101 +201,135 @@ def compute_error_stats(dz, label=""):
     }
 
 
-def fit_plane_svd(points, max_pts=50000):
-    if len(points) > max_pts:
-        idx = np.random.default_rng(42).choice(len(points), size=max_pts, replace=False)
-        sample = points[idx]
-    else:
-        sample = points
+def fit_plane(points):
+    """Plane through a fixed random sample of PLANE_FIT_POINTS of the points.
 
+    Returns the unit normal (pointing up), the offset and the centroid of the sample.
+    """
+    sample = points
+    if len(points) > PLANE_FIT_POINTS:
+        rng = np.random.default_rng(42)
+        sample = points[rng.choice(len(points), size=PLANE_FIT_POINTS, replace=False)]
     centroid = np.mean(sample, axis=0)
-    centered = sample - centroid
-    _, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    _, _, Vt = np.linalg.svd(sample - centroid, full_matrices=False)
     normal = Vt[-1]
-
     if normal[2] < 0:
         normal = -normal
-
-    d = -np.dot(normal, centroid)
-    return normal, d, centroid, S
+    return normal, -np.dot(normal, centroid), centroid
 
 
-def plane_gradient_info(normal):
+def plane_gradient(normal):
+    """Slope of the plane: dZ/dE, dZ/dN, the tilt from horizontal and the uphill
+    direction in degrees counter-clockwise from east."""
     a, b, c = normal
     dz_de = -a / c
     dz_dn = -b / c
     grad_mag = np.sqrt(dz_de**2 + dz_dn**2)
-    grad_dir_deg = np.degrees(np.arctan2(dz_dn, dz_de))
-    tilt_deg = np.degrees(np.arctan(grad_mag))
     return {
         "dz_de": dz_de,
         "dz_dn": dz_dn,
         "gradient_magnitude": grad_mag,
-        "gradient_direction_deg": grad_dir_deg,
-        "tilt_from_horizontal_deg": tilt_deg,
+        "gradient_direction_deg": np.degrees(np.arctan2(dz_dn, dz_de)),
+        "tilt_from_horizontal_deg": np.degrees(np.arctan(grad_mag)),
     }
 
 
-def compute_gridded_metrics(points_utm, wsm_elev, view_ids, cell_size=0.5):
-    from collections import defaultdict
+def read_wsm(wsm_path):
+    with rasterio.open(wsm_path) as src:
+        data = src.read(1).astype(np.float64)
+        if src.nodata is not None:
+            data[data == src.nodata] = np.nan
+        return data, src.transform
 
+
+def wsm_gradient(wsm_path):
+    """Mean slope of the WSM raster, from the gradient of every pixel."""
+    data, transform = read_wsm(wsm_path)
+    sx = transform.a
+    sy = -transform.e
+    grad_row, grad_col = np.gradient(data)
+    dz_de = grad_col / sx
+    dz_dn = -grad_row / sy
+    valid = ~np.isnan(data)
+    dz_de_mean = float(np.nanmean(dz_de[valid]))
+    dz_dn_mean = float(np.nanmean(dz_dn[valid]))
+    grad_mag = np.sqrt(dz_de_mean**2 + dz_dn_mean**2)
+    slope_map = np.sqrt(dz_de**2 + dz_dn**2)
+    return {
+        "dz_de_mean": dz_de_mean,
+        "dz_dn_mean": dz_dn_mean,
+        "gradient_magnitude": grad_mag,
+        "gradient_direction_deg": np.degrees(np.arctan2(dz_dn_mean, dz_de_mean)),
+        "tilt_from_horizontal_deg": np.degrees(np.arctan(grad_mag)),
+        "per_pixel_slope_mean": float(np.nanmean(slope_map[valid])),
+        "per_pixel_slope_max": float(np.nanmax(slope_map[valid])),
+    }
+
+
+def grid_cells(e, n, cell_size_m):
+    """Cell of each point, with the grid origin at the smallest easting and northing.
+
+    Cells are numbered in the order of their first point. Returns the cell of each
+    point, the number of points per cell and the cell centers.
+    """
+    e_min, n_min = e.min(), n.min()
+    ei = ((e - e_min) / cell_size_m).astype(int)
+    ni = ((n - n_min) / cell_size_m).astype(int)
+    _, first, cell, counts = np.unique(
+        ei * (ni.max() + 1) + ni,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    order = np.argsort(first)
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+    first = first[order]
+    center_e = e_min + (ei[first] + 0.5) * cell_size_m
+    center_n = n_min + (ni[first] + 0.5) * cell_size_m
+    return rank[cell], counts[order], center_e, center_n
+
+
+def cell_median(values, cell, counts):
+    # np.median of every cell at once: sort by cell, then by value, and average the
+    # two middle values (the same value twice for an odd count)
+    starts = np.cumsum(counts) - counts
+    v = values[np.lexsort((values, cell))]
+    return (v[starts + (counts - 1) // 2] + v[starts + counts // 2]) / 2
+
+
+def gridded_metrics(points_utm, wsm_elev, view_ids, cell_size_m):
+    """Error of the median Xs elevation per cell against the median WSM elevation.
+
+    Also the view consistency (Z std in cells seen by 2+ views) and the tilt of a
+    plane through the cell medians. Returns the metrics and, for the plot, the
+    error and the center of each cell.
+    """
     valid = ~np.isnan(wsm_elev)
     pts = points_utm[valid]
     wsm_z = wsm_elev[valid]
     vids = view_ids[valid]
 
-    if len(pts) == 0:
-        return {k: 0.0 for k in [
-            'n_cells', 'gridded_bias', 'gridded_rmse', 'gridded_mae',
-            'gridded_tilt', 'within_05m', 'within_1m', 'within_2m',
-            'view_consistency_mean', 'view_consistency_median',
-            'n_multiview_cells',
-        ]}
+    cell, counts, grid_e, grid_n = grid_cells(pts[:, 0], pts[:, 1], cell_size_m)
+    grid_z = cell_median(pts[:, 2], cell, counts)
+    cell_dz = grid_z - cell_median(wsm_z, cell, counts)
 
-    e_min, n_min = pts[:, 0].min(), pts[:, 1].min()
-    ei = ((pts[:, 0] - e_min) / cell_size).astype(int)
-    ni = ((pts[:, 1] - n_min) / cell_size).astype(int)
-
-    cells_z = defaultdict(list)
-    cells_wsm = defaultdict(list)
-    cells_views = defaultdict(set)
-
-    for i in range(len(pts)):
-        key = (ei[i], ni[i])
-        cells_z[key].append(pts[i, 2])
-        cells_wsm[key].append(wsm_z[i])
-        cells_views[key].add(vids[i])
-
-    cell_dz = []
-    cell_std = []
-    cell_nviews = []
-    grid_e, grid_n, grid_z = [], [], []
-
-    for key in cells_z:
-        zvals = np.array(cells_z[key])
-        wvals = np.array(cells_wsm[key])
-        med_z = np.median(zvals)
-        med_wsm = np.median(wvals)
-        cell_dz.append(med_z - med_wsm)
-        cell_std.append(np.std(zvals))
-        cell_nviews.append(len(cells_views[key]))
-        grid_e.append(e_min + (key[0] + 0.5) * cell_size)
-        grid_n.append(n_min + (key[1] + 0.5) * cell_size)
-        grid_z.append(med_z)
-
-    cell_dz = np.array(cell_dz)
-    cell_std = np.array(cell_std)
-    cell_nviews = np.array(cell_nviews)
-    grid_e, grid_n, grid_z = np.array(grid_e), np.array(grid_n), np.array(grid_z)
-
-    within_05 = float((np.abs(cell_dz) < 0.5).mean() * 100)
-    within_1 = float((np.abs(cell_dz) < 1.0).mean() * 100)
-    within_2 = float((np.abs(cell_dz) < 2.0).mean() * 100)
+    # np.std per cell: a vectorized sum adds in a different order, which changes the
+    # last digits
+    cell_std = np.zeros(len(counts), dtype=pts.dtype)
+    starts = np.cumsum(counts) - counts
+    z_by_cell = pts[np.argsort(cell, kind="stable"), 2]
+    for c in np.flatnonzero(counts > 1):
+        cell_std[c] = np.std(z_by_cell[starts[c] : starts[c] + counts[c]])
+    # distinct views per cell, from the unique (cell, view) pairs
+    n_ids = vids.max() + 1
+    cell_nviews = np.bincount(np.unique(cell * n_ids + vids) // n_ids)
 
     multi = cell_nviews >= 2
-    vc_mean = float(np.mean(cell_std[multi])) if multi.sum() > 0 else float('nan')
-    vc_med = float(np.median(cell_std[multi])) if multi.sum() > 0 else float('nan')
+    vc_mean = float(np.mean(cell_std[multi])) if multi.sum() > 0 else float("nan")
+    vc_med = float(np.median(cell_std[multi])) if multi.sum() > 0 else float("nan")
 
+    # tilt of a plane through the cell medians, without the highest and lowest 1%
     z1, z99 = np.percentile(grid_z, [1, 99])
     filt = (grid_z >= z1) & (grid_z <= z99)
     gef, gnf, gzf = grid_e[filt], grid_n[filt], grid_z[filt]
@@ -274,35 +340,33 @@ def compute_gridded_metrics(points_utm, wsm_elev, view_ids, cell_size=0.5):
         nvec /= np.linalg.norm(nvec)
         gridded_tilt = float(np.degrees(np.arccos(abs(nvec[2]))))
     else:
-        gridded_tilt = float('nan')
+        gridded_tilt = float("nan")
 
-    return {
-        'n_cells': int(len(cell_dz)),
-        'gridded_bias': float(np.mean(cell_dz)),
-        'gridded_rmse': float(np.sqrt(np.mean(cell_dz ** 2))),
-        'gridded_mae': float(np.mean(np.abs(cell_dz))),
-        'gridded_tilt': gridded_tilt,
-        'within_05m': within_05,
-        'within_1m': within_1,
-        'within_2m': within_2,
-        'view_consistency_mean': vc_mean,
-        'view_consistency_median': vc_med,
-        'n_multiview_cells': int(multi.sum()),
-        'cell_dz': cell_dz,
-        'grid_e': grid_e,
-        'grid_n': grid_n,
+    metrics = {
+        "n_cells": int(len(cell_dz)),
+        "gridded_bias": float(np.mean(cell_dz)),
+        "gridded_rmse": float(np.sqrt(np.mean(cell_dz**2))),
+        "gridded_mae": float(np.mean(np.abs(cell_dz))),
+        "gridded_tilt": gridded_tilt,
+        "within_05m": float((np.abs(cell_dz) < 0.5).mean() * 100),
+        "within_1m": float((np.abs(cell_dz) < 1.0).mean() * 100),
+        "within_2m": float((np.abs(cell_dz) < 2.0).mean() * 100),
+        "view_consistency_mean": vc_mean,
+        "view_consistency_median": vc_med,
+        "n_multiview_cells": int(multi.sum()),
     }
+    return metrics, (cell_dz, grid_e, grid_n)
 
 
-def plot_gridded_quality(gridded_metrics, wsm_path, label, output_path,
-                         compact=False):
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import TwoSlopeNorm
+def save_figure(output_path, dpi):
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {output_path}")
 
-    gm = gridded_metrics
-    cell_dz = gm['cell_dz']
-    grid_e = gm['grid_e']
-    grid_n = gm['grid_n']
+
+def plot_gridded_quality(gm, cells, label, output_path, compact=False):
+    cell_dz, grid_e, grid_n = cells
 
     ncols = 2 if compact else 3
     figw = 14 if compact else 20
@@ -311,30 +375,43 @@ def plot_gridded_quality(gridded_metrics, wsm_path, label, output_path,
     ax1 = axes[0]
     vmax = max(abs(np.percentile(cell_dz, 2)), abs(np.percentile(cell_dz, 98)), 0.5)
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
-    sc = ax1.scatter(grid_e, grid_n, c=cell_dz, cmap='RdBu_r', norm=norm,
-                     s=1, alpha=0.7, rasterized=True)
-    plt.colorbar(sc, ax=ax1, shrink=0.8, label='dZ = Xs - WSM (m)')
-    ax1.set_xlabel('Easting (m)')
-    ax1.set_ylabel('Northing (m)')
-    ax1.set_title(f'Gridded Water Surface Error\n{label}')
-    ax1.set_aspect('equal')
-    ax1.tick_params(axis='x', rotation=45)
+    sc = ax1.scatter(
+        grid_e,
+        grid_n,
+        c=cell_dz,
+        cmap="RdBu_r",
+        norm=norm,
+        s=1,
+        alpha=0.7,
+        rasterized=True,
+    )
+    plt.colorbar(sc, ax=ax1, shrink=0.8, label="dZ = Xs - WSM (m)")
+    ax1.set_xlabel("Easting (m)")
+    ax1.set_ylabel("Northing (m)")
+    ax1.set_title(f"Gridded Water Surface Error\n{label}")
+    ax1.set_aspect("equal")
+    ax1.tick_params(axis="x", rotation=45)
 
     ax2 = axes[1]
-    ax2.hist(cell_dz, bins=80, color='steelblue', edgecolor='black', alpha=0.7)
-    for thresh, color, ls in [(0.5, 'green', '--'), (1.0, 'orange', '--'), (2.0, 'red', '--')]:
-        ax2.axvline(thresh, color=color, linestyle=ls, label=f'+{thresh}m')
+    ax2.hist(cell_dz, bins=80, color="steelblue", edgecolor="black", alpha=0.7)
+    for thresh, color, ls in [
+        (0.5, "green", "--"),
+        (1.0, "orange", "--"),
+        (2.0, "red", "--"),
+    ]:
+        ax2.axvline(thresh, color=color, linestyle=ls, label=f"+{thresh}m")
         ax2.axvline(-thresh, color=color, linestyle=ls)
-    ax2.axvline(0, color='black', linewidth=1)
-    ax2.set_xlabel('dZ = Xs - WSM (m)')
-    ax2.set_ylabel('Cell count')
-    ax2.set_title(f'Planarity: {gm["within_05m"]:.0f}% < 0.5m, '
-                  f'{gm["within_1m"]:.0f}% < 1m')
+    ax2.axvline(0, color="black", linewidth=1)
+    ax2.set_xlabel("dZ = Xs - WSM (m)")
+    ax2.set_ylabel("Cell count")
+    ax2.set_title(
+        f"Planarity: {gm['within_05m']:.0f}% < 0.5m, {gm['within_1m']:.0f}% < 1m"
+    )
     ax2.legend(fontsize=8)
 
     if not compact:
         ax3 = axes[2]
-        ax3.axis('off')
+        ax3.axis("off")
         text = (
             f"Gridded Water Surface Metrics\n"
             f"{'=' * 35}\n\n"
@@ -351,58 +428,21 @@ def plot_gridded_quality(gridded_metrics, wsm_path, label, output_path,
             f"  Median std:    {gm['view_consistency_median']:.3f} m\n"
             f"  Multi-view:    {gm['n_multiview_cells']:,} cells"
         )
-        ax3.text(0.05, 0.95, text, transform=ax3.transAxes, fontsize=10,
-                 verticalalignment='top', fontfamily='monospace',
-                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+        ax3.text(
+            0.05,
+            0.95,
+            text,
+            transform=ax3.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+        )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {output_path}")
-
-
-def compute_wsm_gradient(wsm_path):
-    import rasterio
-
-    with rasterio.open(wsm_path) as src:
-        data = src.read(1).astype(np.float64)
-        nodata = src.nodata
-        sx = src.transform.a
-        sy = -src.transform.e
-
-    if nodata is not None:
-        data[data == nodata] = np.nan
-
-    grad_row, grad_col = np.gradient(data)
-    dz_de = grad_col / sx
-    dz_dn = -grad_row / sy
-
-    valid = ~np.isnan(data)
-    dz_de_mean = float(np.nanmean(dz_de[valid]))
-    dz_dn_mean = float(np.nanmean(dz_dn[valid]))
-
-    grad_mag = np.sqrt(dz_de_mean**2 + dz_dn_mean**2)
-    grad_dir_deg = np.degrees(np.arctan2(dz_dn_mean, dz_de_mean))
-    tilt_deg = np.degrees(np.arctan(grad_mag))
-
-    slope_map = np.sqrt(dz_de**2 + dz_dn**2)
-
-    return {
-        "dz_de_mean": dz_de_mean,
-        "dz_dn_mean": dz_dn_mean,
-        "gradient_magnitude": grad_mag,
-        "gradient_direction_deg": grad_dir_deg,
-        "tilt_from_horizontal_deg": tilt_deg,
-        "per_pixel_slope_mean": float(np.nanmean(slope_map[valid])),
-        "per_pixel_slope_max": float(np.nanmax(slope_map[valid])),
-    }
-
+    save_figure(output_path, 200)
 
 
 def plot_spatial_error_map(points_utm, dz, output_path):
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import TwoSlopeNorm
-
     valid = ~np.isnan(dz)
     pts = points_utm[valid]
     vals = dz[valid]
@@ -436,22 +476,16 @@ def plot_spatial_error_map(points_utm, dz, output_path):
     ax.set_title("Water Surface Elevation Error (NeRFrac - GT)")
     ax.set_aspect("equal")
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 200)
 
 
-def plot_histogram(dz, output_path):
-    import matplotlib.pyplot as plt
-
-    valid = dz[~np.isnan(dz)]
-    stats = compute_error_stats(valid, "all")
+def plot_histogram(dz, stats, output_path):
+    dz_valid = dz[~np.isnan(dz)]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     ax = axes[0]
-    ax.hist(valid, bins=200, color="steelblue", alpha=0.8, edgecolor="none")
+    ax.hist(dz_valid, bins=200, color="steelblue", alpha=0.8, edgecolor="none")
     ax.axvline(0, color="black", linestyle="-", linewidth=1)
     ax.axvline(
         stats["mean_bias_m"],
@@ -469,12 +503,12 @@ def plot_histogram(dz, output_path):
     )
     ax.set_xlabel("dZ = NeRFrac - WSM (m)")
     ax.set_ylabel("Count")
-    ax.set_title(f"Elevation Difference Distribution (N={len(valid):,})")
+    ax.set_title(f"Elevation Difference Distribution (N={len(dz_valid):,})")
     ax.legend(fontsize=8)
 
     ax2 = axes[1]
-    p5, p95 = np.percentile(valid, [5, 95])
-    clip = valid[(valid >= p5) & (valid <= p95)]
+    p5, p95 = np.percentile(dz_valid, [5, 95])
+    clip = dz_valid[(dz_valid >= p5) & (dz_valid <= p95)]
     ax2.hist(clip, bins=100, color="steelblue", alpha=0.8, edgecolor="none")
     ax2.axvline(0, color="black", linestyle="-", linewidth=1)
     ax2.axvline(stats["mean_bias_m"], color="red", linestyle="--", linewidth=1.5)
@@ -498,38 +532,19 @@ def plot_histogram(dz, output_path):
         bbox=dict(facecolor="white", alpha=0.8),
     )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 200)
 
 
 def plot_per_view(dz, view_ids, n_views, output_path):
-    import matplotlib.pyplot as plt
-
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-    view_stats = []
+    views, biases, rmses = [], [], []
     for v in range(n_views):
         mask = (view_ids == v) & (~np.isnan(dz))
-        if mask.sum() == 0:
-            view_stats.append({"view": v, "n": 0, "bias": 0, "rmse": 0, "std": 0})
-            continue
         d = dz[mask]
-        view_stats.append(
-            {
-                "view": v,
-                "n": int(mask.sum()),
-                "bias": float(np.mean(d)),
-                "rmse": float(np.sqrt(np.mean(d**2))),
-                "std": float(np.std(d)),
-                "median": float(np.median(d)),
-            }
-        )
-
-    views = [s["view"] for s in view_stats]
-    biases = [s["bias"] for s in view_stats]
-    rmses = [s["rmse"] for s in view_stats]
+        views.append(v)
+        biases.append(float(np.mean(d)) if mask.sum() > 0 else 0)
+        rmses.append(float(np.sqrt(np.mean(d**2))) if mask.sum() > 0 else 0)
 
     ax = axes[0]
     colors = ["red" if b > 0 else "blue" for b in biases]
@@ -540,14 +555,12 @@ def plot_per_view(dz, view_ids, n_views, output_path):
     ax.set_title("Per-View Elevation Bias")
     ax.set_xticks(views)
 
-
     ax2 = axes[1]
     ax2.bar(views, rmses, color="steelblue", alpha=0.7, edgecolor="black")
     ax2.set_xlabel("View")
     ax2.set_ylabel("RMSE (m)")
     ax2.set_title("Per-View RMSE")
     ax2.set_xticks(views)
-
 
     ax3 = axes[2]
     boxdata = []
@@ -570,42 +583,19 @@ def plot_per_view(dz, view_ids, n_views, output_path):
     ax3.set_ylabel("dZ (m)")
     ax3.set_title("Per-View dZ Distribution")
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
-
-    return view_stats
+    save_figure(output_path, 200)
 
 
 def plot_unified_3d(points_utm, n_views, label, output_path):
-    import matplotlib.pyplot as plt
-    from collections import defaultdict
-
-
     z_p01 = np.percentile(points_utm[:, 2], 1)
     z_p99 = np.percentile(points_utm[:, 2], 99)
     keep = (points_utm[:, 2] >= z_p01) & (points_utm[:, 2] <= z_p99)
-    pts_valid = points_utm[keep]
+    pts_kept = points_utm[keep]
 
-    cell_size = 0.1
-    e_min = pts_valid[:, 0].min()
-    n_min = pts_valid[:, 1].min()
-    ei = ((pts_valid[:, 0] - e_min) / cell_size).astype(int)
-    ni = ((pts_valid[:, 1] - n_min) / cell_size).astype(int)
-
-    cells = defaultdict(list)
-    for k in range(len(pts_valid)):
-        cells[(ei[k], ni[k])].append(pts_valid[k, 2])
-
-    grid_e, grid_n, grid_z = [], [], []
-    for (ci, cj), zvals in cells.items():
-        grid_e.append(e_min + (ci + 0.5) * cell_size)
-        grid_n.append(n_min + (cj + 0.5) * cell_size)
-        grid_z.append(np.median(zvals))
-    grid_e = np.array(grid_e)
-    grid_n = np.array(grid_n)
-    grid_z = np.array(grid_z)
+    cell, counts, grid_e, grid_n = grid_cells(
+        pts_kept[:, 0], pts_kept[:, 1], GRID_CELL_M
+    )
+    grid_z = cell_median(pts_kept[:, 2], cell, counts)
 
     max_3d = 50000
     if len(grid_e) > max_3d:
@@ -615,58 +605,60 @@ def plot_unified_3d(points_utm, n_views, label, output_path):
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection="3d")
 
-    sc = ax.scatter(grid_e, grid_n, grid_z, c=grid_z, cmap="viridis",
-                    s=2, alpha=0.7)
+    sc = ax.scatter(grid_e, grid_n, grid_z, c=grid_z, cmap="viridis", s=2, alpha=0.7)
     fig.colorbar(sc, ax=ax, shrink=0.5, label="Elevation (m)")
 
     ax.set_xlabel("Easting (m)")
     ax.set_ylabel("Northing (m)")
     ax.set_zlabel("Elevation (m)")
-    ax.set_title(f"Unified Water Surface — {label}\n"
-                 f"({len(grid_e):,} gridded cells from {n_views} views, "
-                 f"{cell_size}m resolution)")
+    ax.set_title(
+        f"Unified Water Surface — {label}\n"
+        f"({len(grid_e):,} gridded cells from {n_views} views, "
+        f"{GRID_CELL_M}m resolution)"
+    )
     ax.view_init(elev=30, azim=-60)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 150)
 
 
-def plot_profiles(points_utm, dz, wsm_path, output_path):
-    import matplotlib.pyplot as plt
-    import rasterio
+def stream_axes(wsm_path):
+    """Centre of the WSM and its axes along and across the stream, from a PCA of the
+    WSM pixel positions."""
+    data, transform = read_wsm(wsm_path)
+    rows, cols = np.where(~np.isnan(data))
+    eastings = transform.c + (cols + 0.5) * transform.a
+    northings = transform.f + (rows + 0.5) * transform.e
+    center_e = np.mean(eastings)
+    center_n = np.mean(northings)
+    xy = np.column_stack([eastings - center_e, northings - center_n])
+    _, _, Vt = np.linalg.svd(xy, full_matrices=False)
+    return center_e, center_n, Vt[0], Vt[1]
 
+
+def binned_median(x, values, n_bins):
+    """Median of the values in equal-width bins of x (NaN for 10 points or fewer).
+
+    Returns the bin centers and the medians.
+    """
+    edges = np.linspace(x.min(), x.max(), n_bins + 1)
+    medians = np.full(n_bins, np.nan)
+    for b in range(n_bins):
+        in_bin = (x >= edges[b]) & (x < edges[b + 1])
+        if in_bin.sum() > 10:
+            medians[b] = np.median(values[in_bin])
+    return 0.5 * (edges[:-1] + edges[1:]), medians
+
+
+def plot_profiles(points_utm, dz, wsm_elev, wsm_path, output_path):
+    """Elevation and error along and across the stream, the main axis of the WSM."""
     valid = ~np.isnan(dz)
     pts = points_utm[valid]
     vals = dz[valid]
     elev_pred = pts[:, 2]
+    wsm_elev = wsm_elev[valid]
 
-
-    wsm_elev = sample_wsm_batch(wsm_path, pts[:, 0], pts[:, 1])
-
-
-    with rasterio.open(wsm_path) as src:
-        data = src.read(1).astype(np.float64)
-        transform = src.transform
-        if src.nodata is not None:
-            data[data == src.nodata] = np.nan
-
-    valid_wsm = ~np.isnan(data)
-    rows_v, cols_v = np.where(valid_wsm)
-    wsm_eastings = transform.c + (cols_v + 0.5) * transform.a
-    wsm_northings = transform.f + (rows_v + 0.5) * transform.e
-    wsm_center_e = np.mean(wsm_eastings)
-    wsm_center_n = np.mean(wsm_northings)
-
-    wsm_xy = np.column_stack(
-        [wsm_eastings - wsm_center_e, wsm_northings - wsm_center_n]
-    )
-    _, _, Vt = np.linalg.svd(wsm_xy, full_matrices=False)
-    stream_dir = Vt[0]
-    cross_dir = Vt[1]
-
-    xy_centered = np.column_stack([pts[:, 0] - wsm_center_e, pts[:, 1] - wsm_center_n])
+    center_e, center_n, stream_dir, cross_dir = stream_axes(wsm_path)
+    xy_centered = np.column_stack([pts[:, 0] - center_e, pts[:, 1] - center_n])
     along = xy_centered @ stream_dir
     cross = xy_centered @ cross_dir
 
@@ -679,101 +671,50 @@ def plot_profiles(points_utm, dz, wsm_path, output_path):
         else np.arange(len(pts))
     )
 
-    ax = axes[0, 0]
-    ax.scatter(
-        along[idx],
-        elev_pred[idx],
-        c="red",
-        s=0.3,
-        alpha=0.2,
-        label="NeRFrac Xs",
-        rasterized=True,
-    )
-    wsm_ok = ~np.isnan(wsm_elev[idx])
-    ax.scatter(
-        along[idx][wsm_ok],
-        wsm_elev[idx][wsm_ok],
-        c="green",
-        s=0.3,
-        alpha=0.2,
-        label="GT WSM",
-        rasterized=True,
-    )
-    ax.set_xlabel("Along-stream distance (m)")
-    ax.set_ylabel("Elevation (m)")
-    ax.set_title("Along-Stream Elevation Profile")
-    ax.legend(markerscale=10)
-
-    ax2 = axes[0, 1]
-    ax2.scatter(along[idx], vals[idx], c="steelblue", s=0.3, alpha=0.2, rasterized=True)
     n_bins = 30
-    bin_edges = np.linspace(along.min(), along.max(), n_bins + 1)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    bin_medians = np.full(n_bins, np.nan)
-    for b in range(n_bins):
-        in_bin = (along >= bin_edges[b]) & (along < bin_edges[b + 1])
-        if in_bin.sum() > 10:
-            bin_medians[b] = np.median(vals[in_bin])
-    ax2.plot(
-        bin_centers,
-        bin_medians,
-        "r-o",
-        markersize=4,
-        linewidth=2,
-        label="Binned median",
-    )
-    ax2.axhline(0, color="black", linewidth=0.5)
-    ax2.set_xlabel("Along-stream distance (m)")
-    ax2.set_ylabel("dZ (m)")
-    ax2.set_title("Along-Stream Elevation Error")
-    ax2.legend()
+    for row, (dist, name) in enumerate([(along, "Along"), (cross, "Cross")]):
+        ax = axes[row, 0]
+        ax.scatter(
+            dist[idx],
+            elev_pred[idx],
+            c="red",
+            s=0.3,
+            alpha=0.2,
+            label="NeRFrac Xs",
+            rasterized=True,
+        )
+        ax.scatter(
+            dist[idx],
+            wsm_elev[idx],
+            c="green",
+            s=0.3,
+            alpha=0.2,
+            label="GT WSM",
+            rasterized=True,
+        )
+        ax.set_xlabel(f"{name}-stream distance (m)")
+        ax.set_ylabel("Elevation (m)")
+        ax.set_title(f"{name}-Stream Elevation Profile")
+        ax.legend(markerscale=10)
 
-    ax3 = axes[1, 0]
-    ax3.scatter(
-        cross[idx],
-        elev_pred[idx],
-        c="red",
-        s=0.3,
-        alpha=0.2,
-        label="NeRFrac Xs",
-        rasterized=True,
-    )
-    ax3.scatter(
-        cross[idx][wsm_ok],
-        wsm_elev[idx][wsm_ok],
-        c="green",
-        s=0.3,
-        alpha=0.2,
-        label="GT WSM",
-        rasterized=True,
-    )
-    ax3.set_xlabel("Cross-stream distance (m)")
-    ax3.set_ylabel("Elevation (m)")
-    ax3.set_title("Cross-Stream Elevation Profile")
-    ax3.legend(markerscale=10)
-
-    ax4 = axes[1, 1]
-    ax4.scatter(cross[idx], vals[idx], c="steelblue", s=0.3, alpha=0.2, rasterized=True)
-    bin_edges_c = np.linspace(cross.min(), cross.max(), n_bins + 1)
-    bin_centers_c = 0.5 * (bin_edges_c[:-1] + bin_edges_c[1:])
-    bin_medians_c = np.full(n_bins, np.nan)
-    for b in range(n_bins):
-        in_bin = (cross >= bin_edges_c[b]) & (cross < bin_edges_c[b + 1])
-        if in_bin.sum() > 10:
-            bin_medians_c[b] = np.median(vals[in_bin])
-    ax4.plot(
-        bin_centers_c,
-        bin_medians_c,
-        "r-o",
-        markersize=4,
-        linewidth=2,
-        label="Binned median",
-    )
-    ax4.axhline(0, color="black", linewidth=0.5)
-    ax4.set_xlabel("Cross-stream distance (m)")
-    ax4.set_ylabel("dZ (m)")
-    ax4.set_title("Cross-Stream Elevation Error")
-    ax4.legend()
+        ax2 = axes[row, 1]
+        ax2.scatter(
+            dist[idx], vals[idx], c="steelblue", s=0.3, alpha=0.2, rasterized=True
+        )
+        centers, medians = binned_median(dist, vals, n_bins)
+        ax2.plot(
+            centers,
+            medians,
+            "r-o",
+            markersize=4,
+            linewidth=2,
+            label="Binned median",
+        )
+        ax2.axhline(0, color="black", linewidth=0.5)
+        ax2.set_xlabel(f"{name}-stream distance (m)")
+        ax2.set_ylabel("dZ (m)")
+        ax2.set_title(f"{name}-Stream Elevation Error")
+        ax2.legend()
 
     fig.suptitle(
         f"Stream axis: ({stream_dir[0]:.3f}, {stream_dir[1]:.3f}) | "
@@ -781,15 +722,10 @@ def plot_profiles(points_utm, dz, wsm_path, output_path):
         fontsize=10,
     )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 200)
 
 
 def plot_tilt_comparison(nerfrac_grad, wsm_grad, output_path):
-    import matplotlib.pyplot as plt
-
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     ax = axes[0]
@@ -878,17 +814,10 @@ def plot_tilt_comparison(nerfrac_grad, wsm_grad, output_path):
     table.scale(1, 1.5)
     ax2.set_title("Tilt/Slope Comparison", pad=20)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 200)
 
 
-
-
-def plot_multiview_3d(points_utm, view_ids, n_views, dz, output_path):
-    import matplotlib.pyplot as plt
-
+def plot_multiview_3d(points_utm, view_ids, n_views, output_path):
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection="3d")
 
@@ -913,16 +842,10 @@ def plot_multiview_3d(points_utm, view_ids, n_views, dz, output_path):
     ax.set_title(f"Water Surface from {n_views} Views (UTM33)")
     ax.view_init(elev=30, azim=-60)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 150)
 
 
 def plot_multiview_analysis(points_utm, view_ids, n_views, output_path):
-
-    import matplotlib.pyplot as plt
-
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     ax1 = axes[0, 0]
@@ -967,7 +890,7 @@ def plot_multiview_analysis(points_utm, view_ids, n_views, output_path):
     ax2.legend()
 
     ax3 = axes[1, 0]
-    normal, d, _, _ = fit_plane_svd(points_utm)
+    normal, d, _ = fit_plane(points_utm)
     residuals = np.dot(points_utm, normal) + d
     ax3.hist(residuals, bins=100, color="coral", edgecolor="black", alpha=0.7)
     ax3.axvline(0, color="red", linestyle="--", linewidth=2)
@@ -980,8 +903,7 @@ def plot_multiview_analysis(points_utm, view_ids, n_views, output_path):
     view_stds = []
     view_list = []
     for i in range(n_views):
-        mask = view_ids == i
-        z_vals = points_utm[mask, 2]
+        z_vals = points_utm[view_ids == i, 2]
         if len(z_vals) == 0:
             continue
         view_list.append(i)
@@ -993,28 +915,14 @@ def plot_multiview_analysis(points_utm, view_ids, n_views, output_path):
     ax4.set_title("Mean Z +/- Std per View")
     ax4.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 150)
 
 
-def plot_camera_positions(
-    testset_dir, points_utm, coord_meta, umeyama, n_views, output_path
-):
-
-    import matplotlib.pyplot as plt
-
+def plot_camera_positions(testset_dir, points_utm, coord_meta, umeyama, output_path):
     pose_files = sorted(glob.glob(os.path.join(testset_dir, "pose_*.npy")))
     if not pose_files:
-        print("  No pose files found, skipping camera visualization.")
+        print("No pose files, camera plot skipped")
         return
-
-    s_um = umeyama["scale"]
-    R_um = umeyama["rotation"]
-    t_um = umeyama["translation"]
-    c2w_recenter = coord_meta["c2w_recenter"]
-    sc = coord_meta["sc"]
 
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection="3d")
@@ -1032,13 +940,12 @@ def plot_camera_positions(
     )
 
     for i, pf in enumerate(pose_files):
-        pose = np.load(pf)
-
-        cam_nerf = pose[:3, 3].copy()
-
-        cam_colmap = nerf_world_to_colmap(cam_nerf, c2w_recenter, sc)
-        cam_utm = apply_umeyama(cam_colmap, s_um, R_um, t_um)
-
+        cam_colmap = nerf_world_to_colmap(
+            np.load(pf)[:3, 3].copy(), coord_meta["c2w_recenter"], coord_meta["sc"]
+        )
+        cam_utm = apply_umeyama(
+            cam_colmap, umeyama["scale"], umeyama["rotation"], umeyama["translation"]
+        )
         ax.scatter(
             cam_utm[0],
             cam_utm[1],
@@ -1057,44 +964,207 @@ def plot_camera_positions(
     ax.set_title(f"Camera Positions & Water Surface — {len(pose_files)} cameras")
     ax.legend()
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+    save_figure(output_path, 150)
 
 
-
-def save_results(
-    output_dir,
-    label,
-    args,
-    global_stats,
-    per_view_stats,
-    points_utm,
-    wsm_elev,
-    nerfrac_grad,
-    wsm_grad,
-    nerfrac_normal,
-    nerfrac_centroid,
-    nerfrac_resid_std,
-    n_matched,
-    n_total,
-    gridded_metrics=None,
-):
-    """Save JSON stats and human-readable text summary."""
-
-    prefix = os.path.join(output_dir, "ws_analysis")
-
-    tilt_ratio = nerfrac_grad["tilt_from_horizontal_deg"] / max(
-        wsm_grad["tilt_from_horizontal_deg"], 1e-6
+def write_summary(stats, path):
+    g = stats["global_stats"]
+    wsm = stats["wsm_gradient"]
+    nerfrac = stats["nerfrac_gradient"]
+    plane = stats["nerfrac_plane"]
+    n_total, n_matched = stats["n_total_xs_points"], stats["n_matched_with_wsm"]
+    lines = [
+        f"Water Surface Analysis: {stats['model_label']}",
+        "=" * 70,
+        "",
+        f"Model:   {stats['log_folder']}",
+        f"Testset: {stats['testset']}",
+        f"WSM:     {stats['wsm_path']}",
+        "",
+        "POINT MATCHING",
+        f"  Total Xs points:      {n_total:,}",
+        f"  Matched with WSM:     {n_matched:,} ({100 * n_matched / n_total:.1f}%)",
+        "",
+        "GLOBAL ELEVATION ERROR (dZ = NeRFrac - GT WSM)",
+        f"  Mean bias:   {g['mean_bias_m']:+.4f} m",
+        f"  Median bias: {g['median_bias_m']:+.4f} m",
+        f"  RMSE:        {g['rmse_m']:.4f} m",
+        f"  MAE:         {g['mae_m']:.4f} m",
+        f"  Std:         {g['std_m']:.4f} m",
+        f"  Range:       [{g['min_m']:.4f}, {g['max_m']:.4f}] m",
+        f"  P5/P95:      [{g['p05_m']:.4f}, {g['p95_m']:.4f}] m",
+        "",
+        "PER-VIEW BREAKDOWN",
+        f"  {'View':>5} {'N':>8} {'Bias (m)':>10} {'RMSE (m)':>10} {'Std (m)':>10}",
+        f"  {'-' * 45}",
+    ]
+    for vs in stats["per_view_stats"]:
+        if vs["n"] > 0:
+            lines.append(
+                f"  {vs['label']:>5} {vs['n']:>8,} {vs['mean_bias_m']:>+10.4f} "
+                f"{vs['rmse_m']:>10.4f} {vs['std_m']:>10.4f}"
+            )
+    lines += [
+        "",
+        "TILT / SLOPE COMPARISON",
+        "  NeRFrac: plane through a 50,000-point sample of the matched Xs points. "
+        "WSM: mean gradient of the raster.",
+        "  Directions point uphill, in degrees counter-clockwise from east.",
+        f"  {'':>25} {'GT WSM':>15} {'NeRFrac':>15}",
+        f"  {'-' * 55}",
+        f"  {'Tilt from horizontal':>25} {wsm['tilt_from_horizontal_deg']:>14.4f}d "
+        f"{nerfrac['tilt_from_horizontal_deg']:>14.4f}d",
+        f"  {'Gradient direction':>25} {wsm['gradient_direction_deg']:>14.1f}d "
+        f"{nerfrac['gradient_direction_deg']:>14.1f}d",
+        "",
+        f"  Tilt ratio (NeRFrac / WSM): {stats['tilt_ratio_nerfrac_over_wsm']:.1f}x",
+        f"  Gradient direction diff: {stats['gradient_direction_diff_deg']:.1f} deg",
+        "",
+        "NERFRAC PLANE FIT (UTM33)",
+        f"  Centroid: E={plane['centroid_utm33'][0]:.2f}, "
+        f"N={plane['centroid_utm33'][1]:.2f}, Z={plane['centroid_utm33'][2]:.3f} m",
+        f"  Residual std: {plane['residual_std_m']:.4f} m",
+        f"  Normal: [{plane['normal'][0]:.6f}, {plane['normal'][1]:.6f}, "
+        f"{plane['normal'][2]:.6f}]",
+        "",
+    ]
+    gm = stats["gridded_metrics"]
+    lines += [
+        "GRIDDED WATER SURFACE (median Z per cell, dZ = cell Z - cell WSM)",
+        f"  Cells:            {gm['n_cells']:,}",
+        f"  Bias:             {gm['gridded_bias']:+.3f} m",
+        f"  RMSE:             {gm['gridded_rmse']:.3f} m",
+        f"  MAE:              {gm['gridded_mae']:.3f} m",
+        f"  Gridded tilt:     {gm['gridded_tilt']:.2f} deg from horizontal "
+        "(plane through the cell medians)",
+        f"  Within 0.5/1/2 m: {gm['within_05m']:.1f}% / {gm['within_1m']:.1f}% / "
+        f"{gm['within_2m']:.1f}%",
+        f"  View consistency: {gm['view_consistency_mean']:.3f} m mean, "
+        f"{gm['view_consistency_median']:.3f} m median Z std "
+        f"({gm['n_multiview_cells']:,} cells seen by 2+ views)",
+        "",
+        "ELEVATION RANGES",
+    ]
+    z = stats["xs_elevation_utm33"]
+    lines.append(
+        f"  NeRFrac Xs: [{z['min']:.3f}, {z['max']:.3f}] m (mean={z['mean']:.3f})"
     )
-    angle_diff = abs(
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Saved: {path}")
+
+
+def main():
+    args = parse_args()
+    testset_dir = os.path.join(args.log_folder, args.testset)
+    for path, exists, what in [
+        (testset_dir, os.path.isdir, "Render folder"),
+        (args.wsm_path, os.path.isfile, "WSM"),
+        (args.umeyama_npz, os.path.isfile, "Umeyama transform"),
+    ]:
+        if not exists(path):
+            print(f"ERROR: {what} not found: {path}")
+            sys.exit(1)
+
+    label = args.label or os.path.basename(os.path.normpath(args.log_folder))
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = os.path.join(
+            "water_surface", label.replace("/", "_").replace(" ", "_")
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    prefix = os.path.join(output_dir, "ws_analysis")
+    print(f"Water surface analysis of {label}: {testset_dir} -> {output_dir}")
+
+    coord_meta = load_nerfrac_coord_metadata(args.log_folder, data_dir=args.data_dir)
+    if coord_meta["c2w_recenter"] is None or coord_meta["sc"] is None:
+        print(
+            f"ERROR: Could not load c2w.npy and llff_scale.npy from {args.log_folder}"
+        )
+        sys.exit(1)
+    H, W, focal = load_focal_from_poses_bounds(args.poses_bounds, factor=args.factor)
+    umeyama = load_umeyama(args.umeyama_npz)
+    # poses_bounds gives H // factor (5460 // 8 = 682 for Pielach), but the rendered
+    # images are as tall as images_<factor> (683), so take H from the rendered pixels
+    xs_files = sorted(glob.glob(os.path.join(testset_dir, "Xs_pts*.npy")))
+    if not xs_files:
+        print(f"ERROR: No Xs_pts*.npy files in {testset_dir}")
+        sys.exit(1)
+    n_pixels = np.load(xs_files[0]).shape[0]
+    if n_pixels % W != 0:
+        print(f"ERROR: {n_pixels:,} rendered pixels do not fit W={W}, check --factor")
+        sys.exit(1)
+    H = n_pixels // W
+    print(f"{W}x{H} px, focal {focal:.4f} px, Umeyama scale {umeyama['scale']:.4f}")
+
+    points_utm, view_ids = load_water_surface(
+        xs_files, H, W, focal, coord_meta, umeyama, args.mask_dir
+    )
+    n_views = len(xs_files)
+
+    wsm_elev = sample_wsm_batch(args.wsm_path, points_utm[:, 0], points_utm[:, 1])
+    matched = ~np.isnan(wsm_elev)
+    n_matched, n_total = int(matched.sum()), len(wsm_elev)
+    print(f"{n_matched:,} of {n_total:,} points on the WSM")
+    if n_matched == 0:
+        print("ERROR: No Xs point lies on the WSM")
+        sys.exit(1)
+
+    dz = points_utm[:, 2] - wsm_elev
+    global_stats = error_stats(dz, "global")
+    per_view_stats = [
+        error_stats(dz[view_ids == v], f"view_{v}")
+        for v in range(n_views)
+        if np.any(view_ids == v)
+    ]
+    print(
+        f"dZ = Xs - WSM: bias {global_stats['mean_bias_m']:+.4f} m, RMSE "
+        f"{global_stats['rmse_m']:.4f} m, MAE {global_stats['mae_m']:.4f} m"
+    )
+
+    normal, d, centroid = fit_plane(points_utm[matched])
+    nerfrac_grad = plane_gradient(normal)
+    resid_std = float(np.std(np.dot(points_utm[matched], normal) + d))
+    wsm_grad = wsm_gradient(args.wsm_path)
+    print(
+        f"Plane tilt {nerfrac_grad['tilt_from_horizontal_deg']:.4f} deg (plane "
+        f"through a 50,000-point sample of the matched points, residual std "
+        f"{resid_std:.4f} m), WSM tilt "
+        f"{wsm_grad['tilt_from_horizontal_deg']:.4f} deg"
+    )
+
+    gm, cells = gridded_metrics(points_utm, wsm_elev, view_ids, GRID_CELL_M)
+    print(
+        f"Gridded ({GRID_CELL_M} m cells): {gm['n_cells']:,} cells, bias "
+        f"{gm['gridded_bias']:+.3f} m, RMSE {gm['gridded_rmse']:.3f} m, tilt "
+        f"{gm['gridded_tilt']:.2f} deg, {gm['within_05m']:.1f}% within 0.5 m, view "
+        f"consistency {gm['view_consistency_mean']:.3f} m"
+    )
+
+    plot_unified_3d(points_utm, n_views, label, f"{prefix}_unified_3d.png")
+    plot_gridded_quality(
+        gm, cells, label, f"{prefix}_gridded_quality.png", args.compact
+    )
+    plot_spatial_error_map(points_utm, dz, f"{prefix}_spatial.png")
+    plot_histogram(dz, global_stats, f"{prefix}_histogram.png")
+    plot_per_view(dz, view_ids, n_views, f"{prefix}_per_view.png")
+    plot_profiles(points_utm, dz, wsm_elev, args.wsm_path, f"{prefix}_profiles.png")
+    plot_tilt_comparison(nerfrac_grad, wsm_grad, f"{prefix}_tilt.png")
+    if not args.skip_multiview:
+        plot_multiview_3d(points_utm, view_ids, n_views, f"{prefix}_multiview_3d.png")
+        plot_multiview_analysis(
+            points_utm, view_ids, n_views, f"{prefix}_multiview_analysis.png"
+        )
+        plot_camera_positions(
+            testset_dir, points_utm, coord_meta, umeyama, f"{prefix}_cameras.png"
+        )
+
+    angle_diff_deg = abs(
         nerfrac_grad["gradient_direction_deg"] - wsm_grad["gradient_direction_deg"]
     )
-    if angle_diff > 180:
-        angle_diff = 360 - angle_diff
-
-    all_stats = {
+    if angle_diff_deg > 180:
+        angle_diff_deg = 360 - angle_diff_deg
+    stats = {
         "model_label": label,
         "log_folder": args.log_folder,
         "testset": args.testset,
@@ -1107,396 +1177,29 @@ def save_results(
         "global_stats": global_stats,
         "per_view_stats": per_view_stats,
         "nerfrac_plane": {
-            "normal": nerfrac_normal.tolist(),
-            "centroid_utm33": nerfrac_centroid.tolist(),
-            "residual_std_m": float(nerfrac_resid_std),
+            "normal": normal.tolist(),
+            "centroid_utm33": centroid.tolist(),
+            "residual_std_m": float(resid_std),
         },
         "nerfrac_gradient": {k: float(v) for k, v in nerfrac_grad.items()},
         "wsm_gradient": {k: float(v) for k, v in wsm_grad.items()},
-        "tilt_ratio_nerfrac_over_wsm": float(tilt_ratio),
-        "gradient_direction_diff_deg": float(angle_diff),
+        "tilt_ratio_nerfrac_over_wsm": float(
+            nerfrac_grad["tilt_from_horizontal_deg"]
+            / max(wsm_grad["tilt_from_horizontal_deg"], 1e-6)
+        ),
+        "gradient_direction_diff_deg": float(angle_diff_deg),
         "xs_elevation_utm33": {
             "min": float(points_utm[:, 2].min()),
             "max": float(points_utm[:, 2].max()),
             "mean": float(points_utm[:, 2].mean()),
             "std": float(points_utm[:, 2].std()),
         },
+        "gridded_metrics": gm,
     }
-
-    if gridded_metrics is not None:
-        gm_save = {k: v for k, v in gridded_metrics.items()
-                    if not isinstance(v, np.ndarray)}
-        all_stats["gridded_metrics"] = gm_save
-
-    stats_path = f"{prefix}_stats.json"
-    with open(stats_path, "w") as f:
-        json.dump(all_stats, f, indent=2)
-    print(f"Saved: {stats_path}")
-
-    # Text summary
-    summary_path = f"{prefix}_summary.txt"
-    with open(summary_path, "w") as f:
-        f.write(f"Water Surface Analysis: {label}\n")
-        f.write(f"{'=' * 70}\n\n")
-        f.write(f"Model:   {args.log_folder}\n")
-        f.write(f"Testset: {args.testset}\n")
-        f.write(f"WSM:     {args.wsm_path}\n\n")
-
-        f.write(f"POINT MATCHING\n")
-        f.write(f"  Total Xs points:      {n_total:,}\n")
-        f.write(
-            f"  Matched with WSM:     {n_matched:,} "
-            f"({100 * n_matched / n_total:.1f}%)\n\n"
-        )
-
-        f.write(f"GLOBAL ELEVATION ERROR (dZ = NeRFrac - GT WSM)\n")
-        f.write(f"  Mean bias:   {global_stats['mean_bias_m']:+.4f} m\n")
-        f.write(f"  Median bias: {global_stats['median_bias_m']:+.4f} m\n")
-        f.write(f"  RMSE:        {global_stats['rmse_m']:.4f} m\n")
-        f.write(f"  MAE:         {global_stats['mae_m']:.4f} m\n")
-        f.write(f"  Std:         {global_stats['std_m']:.4f} m\n")
-        f.write(
-            f"  Range:       [{global_stats['min_m']:.4f}, "
-            f"{global_stats['max_m']:.4f}] m\n"
-        )
-        f.write(
-            f"  P5/P95:      [{global_stats['p05_m']:.4f}, "
-            f"{global_stats['p95_m']:.4f}] m\n\n"
-        )
-
-        f.write(f"PER-VIEW BREAKDOWN\n")
-        f.write(
-            f"  {'View':>5} {'N':>8} {'Bias (m)':>10} "
-            f"{'RMSE (m)':>10} {'Std (m)':>10}\n"
-        )
-        f.write(f"  {'-' * 45}\n")
-        for vs in per_view_stats:
-            if vs["n"] == 0:
-                continue
-            f.write(
-                f"  {vs['label']:>5} {vs['n']:>8,} "
-                f"{vs['mean_bias_m']:>+10.4f} "
-                f"{vs['rmse_m']:>10.4f} "
-                f"{vs['std_m']:>10.4f}\n"
-            )
-
-        f.write(f"\nTILT / SLOPE COMPARISON\n")
-        f.write("  NeRFrac: plane through a 50,000-point sample of the matched Xs "
-                "points. WSM: mean gradient of the raster.\n")
-        f.write("  Directions point uphill, in degrees counter-clockwise from east.\n")
-        f.write(f"  {'':>25} {'GT WSM':>15} {'NeRFrac':>15}\n")
-        f.write(f"  {'-' * 55}\n")
-        f.write(
-            f"  {'Tilt from horizontal':>25} "
-            f"{wsm_grad['tilt_from_horizontal_deg']:>14.4f}d "
-            f"{nerfrac_grad['tilt_from_horizontal_deg']:>14.4f}d\n"
-        )
-        f.write(
-            f"  {'Gradient direction':>25} "
-            f"{wsm_grad['gradient_direction_deg']:>14.1f}d "
-            f"{nerfrac_grad['gradient_direction_deg']:>14.1f}d\n"
-        )
-        f.write(f"\n  Tilt ratio (NeRFrac / WSM): {tilt_ratio:.1f}x\n")
-        f.write(f"  Gradient direction diff: {angle_diff:.1f} deg\n\n")
-
-        f.write(f"NERFRAC PLANE FIT (UTM33)\n")
-        f.write(
-            f"  Centroid: E={nerfrac_centroid[0]:.2f}, "
-            f"N={nerfrac_centroid[1]:.2f}, "
-            f"Z={nerfrac_centroid[2]:.3f} m\n"
-        )
-        f.write(f"  Residual std: {nerfrac_resid_std:.4f} m\n")
-        f.write(
-            f"  Normal: [{nerfrac_normal[0]:.6f}, "
-            f"{nerfrac_normal[1]:.6f}, {nerfrac_normal[2]:.6f}]\n\n"
-        )
-
-        if gridded_metrics is not None:
-            gm = gridded_metrics
-            f.write("GRIDDED WATER SURFACE (median Z per cell, dZ = cell Z - cell WSM)\n")
-            f.write(f"  Cells:            {gm['n_cells']:,}\n")
-            f.write(f"  Bias:             {gm['gridded_bias']:+.3f} m\n")
-            f.write(f"  RMSE:             {gm['gridded_rmse']:.3f} m\n")
-            f.write(f"  MAE:              {gm['gridded_mae']:.3f} m\n")
-            f.write(f"  Gridded tilt:     {gm['gridded_tilt']:.2f} deg from horizontal "
-                    f"(plane through the cell medians)\n")
-            f.write(f"  Within 0.5/1/2 m: {gm['within_05m']:.1f}% / "
-                    f"{gm['within_1m']:.1f}% / {gm['within_2m']:.1f}%\n")
-            f.write(f"  View consistency: {gm['view_consistency_mean']:.3f} m mean, "
-                    f"{gm['view_consistency_median']:.3f} m median Z std "
-                    f"({gm['n_multiview_cells']:,} cells seen by 2+ views)\n\n")
-
-        f.write(f"ELEVATION RANGES\n")
-        f.write(
-            f"  NeRFrac Xs: [{points_utm[:, 2].min():.3f}, "
-            f"{points_utm[:, 2].max():.3f}] m "
-            f"(mean={points_utm[:, 2].mean():.3f})\n"
-        )
-
-    print(f"Saved: {summary_path}")
-
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="NeRFrac water surface (Xs) vs GT WSM analysis"
-    )
-    parser.add_argument(
-        "--log_folder",
-        type=str,
-        required=True,
-        help="Path to NeRFrac experiment log folder",
-    )
-    parser.add_argument(
-        "--testset",
-        type=str,
-        required=True,
-        help="Testset subdirectory name (e.g. testset_all_600000)",
-    )
-    parser.add_argument(
-        "--poses_bounds",
-        type=str,
-        required=True,
-        help="Path to poses_bounds.npy for this dataset",
-    )
-    parser.add_argument(
-        "--factor",
-        type=int,
-        required=True,
-        help="Image downscale factor used during training",
-    )
-    parser.add_argument(
-        "--wsm_path",
-        type=str,
-        required=True,
-        help="Path to GT Water Surface Model GeoTIFF",
-    )
-    parser.add_argument(
-        "--umeyama_npz",
-        type=str,
-        required=True,
-        help="Path to Umeyama .npz (from 01_compute_umeyama.py)",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Output directory (default: water_surface/<label>)",
-    )
-    parser.add_argument(
-        "--label",
-        type=str,
-        default=None,
-        help="Human-readable model label for plots and summary",
-    )
-    parser.add_argument(
-        "--mask_dir",
-        type=str,
-        default=None,
-        help="Path to water mask directory. STRONGLY RECOMMENDED: without masks, "
-             "land pixels with meaningless Xs values contaminate the analysis.",
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default=None,
-        help="LLFF data dir (for coord_meta fallback if log folder lacks it)",
-    )
-    parser.add_argument(
-        "--skip_multiview",
-        action="store_true",
-        help="Skip multiview geometry visualizations (faster)",
-    )
-    parser.add_argument(
-        "--compact",
-        action="store_true",
-        help="Compact gridded quality plot (2 panels, no metrics text)",
-    )
-    return parser.parse_args()
-
-
-
-def main():
-    args = parse_args()
-
-    testset_dir = os.path.join(args.log_folder, args.testset)
-    if not os.path.isdir(testset_dir):
-        print(f"[ERROR] Testset directory not found: {testset_dir}")
-        sys.exit(1)
-    if not os.path.isfile(args.wsm_path):
-        print(f"[ERROR] WSM GeoTIFF not found: {args.wsm_path}")
-        sys.exit(1)
-    if not os.path.isfile(args.umeyama_npz):
-        print(f"[ERROR] Umeyama .npz not found: {args.umeyama_npz}")
-        sys.exit(1)
-
-    label = args.label or os.path.basename(os.path.normpath(args.log_folder))
-    output_dir = args.output_dir
-    if output_dir is None:
-        safe_label = label.replace("/", "_").replace(" ", "_")
-        output_dir = os.path.join("water_surface", safe_label)
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("=" * 80)
-    print(f"Water Surface Analysis: {label}")
-    print(f"  Log folder:  {args.log_folder}")
-    print(f"  Testset:     {args.testset}")
-    print(f"  WSM:         {args.wsm_path}")
-    print(f"  Umeyama:     {args.umeyama_npz}")
-    print(f"  Mask dir:    {args.mask_dir or '(none — land pixels included!)'}")
-    print(f"  Output:      {output_dir}")
-    print("=" * 80)
-
-    print("\n--- Loading coordinate metadata ---")
-    coord_meta = load_nerfrac_coord_metadata(args.log_folder, data_dir=args.data_dir)
-    H, W, focal = load_focal_from_poses_bounds(args.poses_bounds, factor=args.factor)
-    umeyama = load_umeyama(args.umeyama_npz)
-
-    xs_files_check = sorted(glob.glob(os.path.join(testset_dir, "Xs_pts*.npy")))
-    if xs_files_check:
-        try:
-            xs0 = np.load(xs_files_check[0])
-            n_pixels = xs0.shape[0]
-            H_actual = n_pixels // W
-            if H_actual * W == n_pixels and H_actual != H:
-                print(
-                    f"  [INFO] Adjusting H from poses_bounds ({H}) to actual "
-                    f"model output ({H_actual}) — {n_pixels} pixels = "
-                    f"{H_actual}x{W}"
-                )
-                H = H_actual
-            elif H_actual * W != n_pixels:
-                print(f"[ERROR] {n_pixels} rendered pixels do not fit W={W}, "
-                      f"check --factor")
-                sys.exit(1)
-        except Exception:
-            pass
-
-    print(f"  Image size: {H}x{W}, focal={focal:.4f}")
-    print(f"  Umeyama scale: {umeyama['scale']:.4f}")
-
-    print("\n--- Loading Xs points (NDC -> COLMAP -> UTM33) ---")
-    xs_data = load_xs_all_views(testset_dir, H, W, focal, coord_meta, umeyama,
-                                mask_dir=args.mask_dir)
-    points_utm = xs_data["points_utm"]
-    view_ids = xs_data["view_ids"]
-    n_views = xs_data["n_views"]
-
-    print(
-        f"\nXs UTM33 elevation range: "
-        f"[{points_utm[:, 2].min():.3f}, {points_utm[:, 2].max():.3f}] m"
-    )
-
-    print("\n--- Sampling WSM at Xs points ---")
-    wsm_elev = sample_wsm_batch(args.wsm_path, points_utm[:, 0], points_utm[:, 1])
-    n_matched = int(np.sum(~np.isnan(wsm_elev)))
-    n_total = len(wsm_elev)
-    print(f"  Matched: {n_matched:,} / {n_total:,} ({100 * n_matched / n_total:.1f}%)")
-
-    if n_matched == 0:
-        print("[ERROR] No Xs points overlap with WSM raster!")
-        sys.exit(1)
-
-    print("\n--- Computing elevation differences ---")
-    dz = points_utm[:, 2] - wsm_elev
-
-    global_stats = compute_error_stats(dz, "global")
-    print(f"  Mean bias:  {global_stats['mean_bias_m']:+.4f} m")
-    print(f"  RMSE:       {global_stats['rmse_m']:.4f} m")
-    print(f"  MAE:        {global_stats['mae_m']:.4f} m")
-    print(f"  Std:        {global_stats['std_m']:.4f} m")
-
-
-    per_view_stats = []
-    for v in range(n_views):
-        mask = view_ids == v
-        if mask.sum() == 0:
-            continue
-        per_view_stats.append(compute_error_stats(dz[mask], f"view_{v}"))
-
-    print("\n--- Plane fit + tilt analysis ---")
-    matched = ~np.isnan(wsm_elev)
-    normal, d, centroid, S = fit_plane_svd(points_utm[matched])
-    nerfrac_grad = plane_gradient_info(normal)
-    resid = np.dot(points_utm[matched], normal) + d
-    resid_std = float(np.std(resid))
-    print(f"  Plane residual std: {resid_std:.4f} m")
-    print(f"  Plane tilt: {nerfrac_grad['tilt_from_horizontal_deg']:.4f} deg "
-          f"(plane through a 50,000-point sample of the matched points)")
-
-    wsm_grad = compute_wsm_gradient(args.wsm_path)
-    print(f"  WSM tilt: {wsm_grad['tilt_from_horizontal_deg']:.4f} deg")
-
-    print("\n--- Gridded water surface metrics (0.1m cells, median Z) ---")
-    gridded_metrics = compute_gridded_metrics(
-        points_utm, wsm_elev, view_ids, cell_size=0.1
-    )
-    gm = gridded_metrics
-    print(f"  Gridded cells:    {gm['n_cells']}")
-    print(f"  Gridded bias:     {gm['gridded_bias']:+.3f} m")
-    print(f"  Gridded RMSE:     {gm['gridded_rmse']:.3f} m")
-    print(f"  Gridded MAE:      {gm['gridded_mae']:.3f} m")
-    print(f"  Gridded tilt:     {gm['gridded_tilt']:.2f} deg")
-    print(f"  Within 0.5m:      {gm['within_05m']:.1f}%")
-    print(f"  Within 1.0m:      {gm['within_1m']:.1f}%")
-    print(f"  Within 2.0m:      {gm['within_2m']:.1f}%")
-    print(f"  View consistency: {gm['view_consistency_mean']:.3f} m "
-          f"(median {gm['view_consistency_median']:.3f} m, "
-          f"{gm['n_multiview_cells']} multi-view cells)")
-
-    print("\n--- Generating visualizations ---")
-    prefix = os.path.join(output_dir, "ws_analysis")
-
-    plot_unified_3d(points_utm, n_views, label,
-                    f"{prefix}_unified_3d.png")
-
-    plot_gridded_quality(gridded_metrics, args.wsm_path, label,
-                         f"{prefix}_gridded_quality.png",
-                         compact=args.compact)
-
-    plot_spatial_error_map(points_utm, dz, f"{prefix}_spatial.png")
-    plot_histogram(dz, f"{prefix}_histogram.png")
-    plot_per_view(dz, view_ids, n_views, f"{prefix}_per_view.png")
-    plot_profiles(points_utm, dz, args.wsm_path, f"{prefix}_profiles.png")
-    plot_tilt_comparison(nerfrac_grad, wsm_grad, f"{prefix}_tilt.png")
-
-    if not args.skip_multiview:
-        print("\n--- Generating multiview visualizations ---")
-        plot_multiview_3d(points_utm, view_ids, n_views, dz, f"{prefix}_multiview_3d.png")
-        plot_multiview_analysis(
-            points_utm, view_ids, n_views, f"{prefix}_multiview_analysis.png"
-        )
-        plot_camera_positions(
-            testset_dir,
-            points_utm,
-            coord_meta,
-            umeyama,
-            n_views,
-            f"{prefix}_cameras.png",
-        )
-
-    print("\n--- Saving results ---")
-    save_results(
-        output_dir,
-        label,
-        args,
-        global_stats,
-        per_view_stats,
-        points_utm,
-        wsm_elev,
-        nerfrac_grad,
-        wsm_grad,
-        normal,
-        centroid,
-        resid_std,
-        n_matched,
-        n_total,
-        gridded_metrics=gridded_metrics,
-    )
-
-    print(f"\n{'=' * 80}")
-    print(f"DONE. All outputs saved to: {output_dir}")
-    print(f"{'=' * 80}")
+    with open(f"{prefix}_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Saved: {prefix}_stats.json")
+    write_summary(stats, f"{prefix}_summary.txt")
 
 
 if __name__ == "__main__":
