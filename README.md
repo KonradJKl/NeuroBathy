@@ -140,8 +140,8 @@ flowchart TD
 | Land control points | [`postprocessing/14_control_point_validation.py`](postprocessing/14_control_point_validation.py) |
 | Comparison with the bathymetric LiDAR | [`postprocessing/15_lidar_comparison.py`](postprocessing/15_lidar_comparison.py) |
 
-The scripts in `postprocessing/`, `models/vggt/` and `sam3_mask_generator/` have usage
-examples at the top. The numbers are kept from my thesis code, so some are missing. For
+Every script has usage examples at the top. The numbers are kept from my thesis code,
+so some are missing. For
 VGGT the order is `run_vggt_inference.py`, 01 (`--mode vggt`), 04, 02 (`--mode vggt` on
 the output folder of 04) and 03.
 

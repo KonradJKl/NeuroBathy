@@ -1,3 +1,21 @@
+"""
+Train NeRFrac on an LLFF scene with water masks, or render a trained model.
+
+Run from models/nerfrac_modified/: basedir, datadir and tensorboard/ are relative to
+the working directory.
+
+Usage examples:
+    # Train
+    python run_nerfrac.py --config configs/pielach.txt
+
+    # Render every view into logs/<experiment>/renderonly_all_<iteration>/
+    python run_nerfrac.py --config configs/pielach.txt --render_only --render_all
+
+    # Render the test views with a specific checkpoint
+    python run_nerfrac.py --config configs/pielach.txt --render_only --render_test \\
+        --ft_path logs/<experiment>/200000.tar
+"""
+
 import os
 import numpy as np
 import imageio
@@ -30,6 +48,9 @@ def set_seed(seed):
 # NeRFrac.smooth() indexes into it (2 = top, 4 = left, 5 = right, 7 = bottom).
 NEIGHBOR_OFFSETS = [(0, 0), (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 MAX_MATCH_DIST_PX = 15.0
+# load_llff_data scales the scene by 1 / (smallest depth bound * BD_FACTOR), and
+# llff_scale.npy stores that scale for the postprocessing
+BD_FACTOR = 0.75
 
 
 def gather_neighbor_rays(rays_o_full, rays_d_full, coords, H, W):
@@ -187,6 +208,11 @@ def render(
     pixel_water_mask=None,
     **kwargs,
 ):
+    """Render a full view from c2w, or a given ray batch, in groups of 9 rays.
+
+    Every ray comes with its 3x3 neighbors (NEIGHBOR_OFFSETS), which NeRFrac uses for
+    the surface normal and the smoothness loss.
+    """
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
@@ -221,7 +247,14 @@ def render(
 
 
 def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, args=None, masks=None):
+    """Render the poses and save the per-view outputs that the postprocessing reads.
 
+    With savedir, view NNN gets <expname>NNN.png, <expname>NNN_depth.npy (expected depth),
+    <expname>NNN_depth_mode.npy (depth of the sample with the highest weight),
+    <expname>NNN_acc.npy, Xs_ptsNNN.npy (water surface points), rays_NNN.npy (refracted
+    directions) and pose_NNN.npy, plus <expname>NNN_masked.png and <expname>NNN_rgba.png
+    when masks are given. With gt_imgs, result.txt gets PSNR, SSIM and LPIPS per view.
+    """
     H, W, focal = hwf
 
     if render_factor != 0:
@@ -282,38 +315,33 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             filename = os.path.join(savedir, args.expname + "{:03d}.png".format(i))
             imageio.imwrite(filename, rgb8)
 
-            # --- Save masked ---
             if mask_i is not None:
                 mask_binary = (mask_i > 0.5).astype(np.float32)
                 rgb_masked = rgb8.copy()
                 rgb_masked[mask_binary < 0.5] = 0  # Black outside
 
                 masked_filename = os.path.join(
-                    savedir, args.expname + "{:03d}_masked.png".format(i)
+                    savedir, f"{args.expname}{i:03d}_masked.png"
                 )
                 imageio.imwrite(masked_filename, rgb_masked)
 
-                # save with RGBA
                 rgba = np.concatenate(
                     [rgb8, (mask_binary * 255).astype(np.uint8)[..., None]], axis=-1
                 )
                 rgba_filename = os.path.join(
-                    savedir, args.expname + "{:03d}_rgba.png".format(i)
+                    savedir, f"{args.expname}{i:03d}_rgba.png"
                 )
                 imageio.imwrite(rgba_filename, rgba)
-            # --- END Save masked ---
 
             Xs_pts = Xs.cpu().numpy()
             ptsname = os.path.join(savedir, "Xs_pts{:03d}.npy".format(i))
             np.save(ptsname, Xs_pts)
 
-            # --- Save camera pose ---
-            posename = os.path.join(savedir, "pose_{:03d}.npy".format(i))
+            posename = os.path.join(savedir, f"pose_{i:03d}.npy")
             np.save(posename, c2w[:3, :4].cpu().numpy())
 
-            # --- Save rays ---
             ray_dir = sample_ray.cpu().numpy()
-            np.save(os.path.join(savedir, "rays_{:03d}.npy".format(i)), ray_dir)
+            np.save(os.path.join(savedir, f"rays_{i:03d}.npy"), ray_dir)
 
             if gt_imgs is not None:
                 gt_img = to8b(gt_imgs[i].cpu().numpy())
@@ -373,7 +401,8 @@ def create_nerf(args):
     model_fine = None
     if args.N_importance > 0:
         # fine sampling is used in class NeRFrac forward and not here
-        # never called, but its parameters are in every checkpoint's optimizer state
+        # model_fine is never called, but its parameters are in the optimizer state of
+        # every checkpoint, so it stays
         model_fine = NeRF.get_by_name(
             args.nerf_type,
             D=args.netdepth_fine,
@@ -431,6 +460,7 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
         start = ckpt["global_step"]
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # checkpoints saved from a torch.compile model carry an _orig_mod. prefix
         fn_state = {
             k.replace("_orig_mod.", ""): v
             for k, v in ckpt["network_fn_state_dict"].items()
@@ -494,6 +524,10 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
     return rgb_map, disp_map, acc_map, weights, depth_map, depth_mode
 
 def distortion_loss(weights, z_vals):
+    """Mip-NeRF 360 distortion loss (eq. 15) in prefix-sum form.
+
+    The last, unbounded interval is left out.
+    """
     t_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
     delta = z_vals[..., 1:] - z_vals[..., :-1]
     w = weights[..., :-1]  # (N_rays, N_samples-1)
@@ -619,7 +653,7 @@ def config_parser():
         "--ft_path",
         type=str,
         default=None,
-        help="specific weights npy file to reload for coarse network",
+        help=".tar checkpoint to load instead of the latest one in basedir/expname",
     )
 
     # rendering options
@@ -663,7 +697,8 @@ def config_parser():
     parser.add_argument(
         "--render_only",
         action="store_true",
-        help="do not optimize, reload weights and render out render_poses path",
+        help="render instead of training: the test views with --render_test, the training "
+        "views with --render_train, all views with --render_all, otherwise the spiral path",
     )
     parser.add_argument(
         "--render_test",
@@ -679,9 +714,11 @@ def config_parser():
     parser.add_argument(
         "--render_train",
         action="store_true",
-        help="Render training views instead of test views",
+        help="render the training views",
     )
-    parser.add_argument("--render_all", action="store_true", help="Render all views")
+    parser.add_argument(
+        "--render_all", action="store_true", help="render all views in dataset order"
+    )
 
     # dataset options
     parser.add_argument(
@@ -715,7 +752,7 @@ def config_parser():
         "--i_print",
         type=int,
         default=1000,
-        help="frequency of console printout and metric loggin",
+        help="frequency of console printout and metric logging",
     )
     parser.add_argument(
         "--i_weights", type=int, default=10000, help="frequency of weight ckpt saving"
@@ -730,9 +767,20 @@ def config_parser():
         help="frequency of render_poses video saving",
     )
 
-    parser.add_argument("--yita", type=float, default=1.0, help="refractive index")
+    parser.add_argument(
+        "--yita",
+        type=float,
+        default=1.0,
+        help="refractive index of the water (1.333 in the configs)",
+    )
 
-    parser.add_argument("--water", type=int, default=1, help="with water surface")
+    parser.add_argument(
+        "--water",
+        type=int,
+        default=1,
+        help="1 if the scene has a water surface: refracts rays when no masks are loaded "
+        "and enables the smoothness and consistency losses",
+    )
     parser.add_argument("--initdepth", type=float, default=-0.6, help="initial depth")
     parser.add_argument(
         "--tframe",
@@ -754,7 +802,7 @@ def config_parser():
         help="log2 of max freq for positional encoding (refractive field dir)",
     )
 
-    # --- Collapse prevention ---
+    # regularization
     parser.add_argument(
         "--smooth_weight",
         type=float,
@@ -774,7 +822,7 @@ def config_parser():
         help="max gradient norm for clipping (0 to disable)",
     )
 
-    # --- Multi-view depth consistency loss ---
+    # multi-view depth consistency
     parser.add_argument(
         "--consistency_weight",
         type=float,
@@ -799,12 +847,13 @@ def config_parser():
         default=256,
         help="number of water pixels to sample per view for consistency loss",
     )
-    # --- Distortion loss (Mip-NeRF 360) ---
+
+    # distortion and flatness
     parser.add_argument(
         "--distortion_weight",
         type=float,
         default=0.0,
-        help="weight for distortion loss (0 to disable). Try 0.01-0.1",
+        help="weight for distortion loss (0 to disable, the thesis models use 0.01)",
     )
     parser.add_argument(
         "--distortion_warmup",
@@ -816,7 +865,7 @@ def config_parser():
         "--flatness_weight",
         type=float,
         default=0.0,
-        help="weight for water surface flatness loss (0 to disable). Penalizes variance of Xs Z across water rays in each batch.",
+        help="weight for the flatness loss, the variance of the water surface height (0 to disable)",
     )
     parser.add_argument(
         "--flatness_warmup",
@@ -838,23 +887,8 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
     args.expname = (
-        args.expname
-        + "_"
-        + args.nerf_type
-        + "_d"
-        + str(args.initdepth)
-        + "_yita"
-        + str(args.yita)
-        + "_tframe"
-        + str(args.tframe)
-        + "_factor"
-        + str(args.factor)
-        + "multires"
-        + str(args.omultires)
-        + "_"
-        + str(args.refracvmultires)
-        + "_"
-        + str(args.N_samples)
+        f"{args.expname}_{args.nerf_type}_d{args.initdepth}_yita{args.yita}_tframe{args.tframe}"
+        f"_factor{args.factor}multires{args.omultires}_{args.refracvmultires}_{args.N_samples}"
     )
 
     if not os.path.exists("./tensorboard/" + args.expname):
@@ -866,7 +900,7 @@ def train():
         args.datadir,
         args.factor,
         recenter=True,
-        bd_factor=0.75,
+        bd_factor=BD_FACTOR,
         spherify=args.spherify,
         load_masks=True,
     )
@@ -938,7 +972,7 @@ def train():
     np.save(os.path.join(exp_dir, "c2w.npy"), c2w_recenter)
     pb = np.load(os.path.join(args.datadir, "poses_bounds.npy"))
     bds_raw = pb[:, -2:]
-    sc = 1.0 / (bds_raw.min() * 0.75)
+    sc = 1.0 / (bds_raw.min() * BD_FACTOR)
     np.save(os.path.join(exp_dir, "llff_scale.npy"), np.array([sc]))
     print(f"Saved c2w.npy and llff_scale.npy (sc={sc:.8f}) to {exp_dir}")
 
@@ -1018,7 +1052,7 @@ def train():
                         np.uint8
                     )
                     imageio.imwrite(
-                        os.path.join(testsavedir, "{:03d}_err.png".format(k)),
+                        os.path.join(testsavedir, f"{k:03d}_err.png"),
                         err_map_colored,
                     )
                     if render_masks is not None:
@@ -1027,7 +1061,7 @@ def train():
                             colorize_np(masked_err, range=(0.0, 1.0)) * 255
                         ).astype(np.uint8)
                         imageio.imwrite(
-                            os.path.join(testsavedir, "{:03d}_err_masked.png".format(k)),
+                            os.path.join(testsavedir, f"{k:03d}_err_masked.png"),
                             err_map_masked_colored,
                         )
 
@@ -1042,7 +1076,6 @@ def train():
     print("done, concats")
     rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
     rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
-    # Pre-compute neighbor arrangement for ALL training pixels
     print("Arranging neighbor rays for all training pixels...")
     filtered_rays_list = []
     water_flags_list = []
@@ -1149,7 +1182,7 @@ def train():
 
         psnr = mse2psnr(img_loss)
 
-        # --- Multi-view depth consistency loss ---
+        # Multi-view depth consistency loss
         consistency_loss = torch.tensor(0.0, device=device)
         n_consist_pairs = 0
         effective_consist_weight = 0.0
@@ -1180,12 +1213,11 @@ def train():
                 torch.cuda.empty_cache()
                 tqdm.write(f"Iter {i:,}: consistency loss skipped (CUDA out of memory)")
 
-        # --- TensorBoard logging ---
-        writer.add_scalar("loss_smooth", smooth_loss, global_step=i)
+        writer.add_scalar("loss/smooth", smooth_loss, global_step=i)
         writer.add_scalar("psnr", psnr, global_step=i, walltime=None)
         writer.add_scalar("loss", loss, global_step=i, walltime=None)
         writer.add_scalar(
-            "smooth_weight_effective", effective_smooth_weight, global_step=i
+            "smooth/effective_weight", effective_smooth_weight, global_step=i
         )
         if args.water == 1:
             with torch.no_grad():
