@@ -11,6 +11,7 @@ import pandas as pd
 from run_nerfrac_helpers import *
 
 from load_llff import load_llff_data
+from skimage.transform import resize
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,198 +26,91 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_consistency_rays(rays_o_full, rays_d_full, coords, H, W):
-    """Build 9-neighbor ray batch for a set of pixel coordinates.
+# Order of the 3x3 neighborhood that every ray carries: center first, then row by row.
+# NeRFrac.smooth() indexes into it (2 = top, 4 = left, 5 = right, 7 = bottom).
+NEIGHBOR_OFFSETS = [(0, 0), (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+MAX_MATCH_DIST_PX = 15.0
 
-    :param rays_o_full: (H, W, 3) ray origins for full image
-    :param rays_d_full: (H, W, 3) ray directions for full image
-    :param coords: (N, 2) long tensor of [row, col] pixel coordinates
-    :param H: image height
-    :param W: image width
-    :return: batch_rays (2, N*9, 3) tensor ready for render()
+
+def gather_neighbor_rays(rays_o_full, rays_d_full, coords, H, W):
+    rows, cols = coords[:, 0], coords[:, 1]
+    neighbors_o, neighbors_d = [], []
+    for dh, dw in NEIGHBOR_OFFSETS:
+        r = torch.clamp(rows + dh, 0, H - 1)
+        c = torch.clamp(cols + dw, 0, W - 1)
+        neighbors_o.append(rays_o_full[r, c])
+        neighbors_d.append(rays_d_full[r, c])
+    rays_o = torch.stack(neighbors_o, dim=1).reshape(-1, 3)
+    rays_d = torch.stack(neighbors_d, dim=1).reshape(-1, 3)
+    return torch.stack([rays_o, rays_d], dim=0)
+
+
+def render_water_points(pose, coords, H, W, K, render_kwargs, chunk):
+    rays_o, rays_d = get_rays(H, W, K, pose)
+    batch_rays = gather_neighbor_rays(rays_o, rays_d, coords, H, W)
+    water_mask = torch.ones(len(coords), device=coords.device)
+    _, _, _, Xs, depth, sample_ray, _ = render(
+        H, W, K, chunk=chunk, rays=batch_rays, pixel_water_mask=water_mask, **render_kwargs
+    )
+    P_ndc = Xs + depth.unsqueeze(-1) * sample_ray
+    return render_kwargs["network_fn"].ndcp2camp(P_ndc, W=W, H=H, f=float(K[0][0]))
+
+
+def project_to_view(P_world, pose, focal, H, W):
+    P_cam = (P_world - pose[:3, 3]) @ pose[:3, :3]
+    in_front = P_cam[:, 2] < -1e-6
+    u = focal * P_cam[:, 0] / (-P_cam[:, 2]) + W * 0.5
+    # get_rays() uses y = -(j - cy) / f, so the row is j = -f * y / (-z) + H / 2
+    v = -focal * P_cam[:, 1] / (-P_cam[:, 2]) + H * 0.5
+    in_view = in_front & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    return torch.stack([v, u], dim=-1), in_view
+
+
+def match_points(proj_rc, in_view, P_src, coords_other, P_other):
+    zero = torch.zeros((), device=P_src.device)
+    if not in_view.any():
+        return zero, 0
+    nn_dist, nn_idx = torch.cdist(proj_rc[in_view], coords_other.float()).min(dim=1)
+    close = nn_dist < MAX_MATCH_DIST_PX
+    if not close.any():
+        return zero, 0
+    mse = torch.mean((P_src[in_view][close] - P_other[nn_idx[close]]) ** 2)
+    return mse, int(close.sum().item())
+
+
+def compute_consistency_loss(poses, masks, H, W, K, i_train, render_kwargs, N_consist, chunk, device):
+    """Multi-view depth consistency loss between two random training views.
+
+    Renders up to N_consist water pixels in each view, projects the underwater points of
+    each view into the other and penalizes the 3D distance to the nearest rendered pixel.
     """
-    N = coords.shape[0]
-    dev = rays_o_full.device
-    neighbor_offsets = [
-        (-1, -1),
-        (-1, 0),
-        (-1, 1),
-        (0, -1),
-        (0, 1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-    ]
-
-    all_o = torch.zeros(N, 9, 3, device=dev)
-    all_d = torch.zeros(N, 9, 3, device=dev)
-
-    rows = coords[:, 0]  # (N,)
-    cols = coords[:, 1]  # (N,)
-
-    # Center ray (index 0)
-    all_o[:, 0] = rays_o_full[rows, cols]
-    all_d[:, 0] = rays_d_full[rows, cols]
-
-    # 8 neighbors (indices 1-8)
-    for idx, (dh, dw) in enumerate(neighbor_offsets):
-        nh = torch.clamp(rows + dh, 0, H - 1)
-        nw = torch.clamp(cols + dw, 0, W - 1)
-        all_o[:, idx + 1] = rays_o_full[nh, nw]
-        all_d[:, idx + 1] = rays_d_full[nh, nw]
-
-    # Flatten to (N*9, 3) and stack as (2, N*9, 3)
-    all_o = all_o.reshape(-1, 3)
-    all_d = all_d.reshape(-1, 3)
-    batch_rays = torch.stack([all_o, all_d], dim=0)  # (2, N*9, 3)
-
-    return batch_rays
-
-
-def compute_consistency_loss(
-    poses, masks, H, W, K, i_train, render_kwargs, N_consist, chunk, device
-):
-    """Multi-view depth consistency loss.
-
-    Picks two random training views, renders N_consist water pixels in each,
-    projects 3D underwater points from view A into view B's image plane,
-    finds nearest rendered pixel in B, and penalizes 3D position disagreement.
-
-    :return: (loss_scalar, n_matched_pairs) tuple
-    """
-    torch.cuda.empty_cache()
-
-    focal = float(K[0][0])
-
-    # Pick 2 random training views
-    pair = random.sample(list(i_train), 2)
-    idx_a, idx_b = pair
-    pose_a = poses[idx_a, :3, :4]  # (3, 4) c2w
+    idx_a, idx_b = random.sample(list(i_train), 2)
+    pose_a = poses[idx_a, :3, :4]
     pose_b = poses[idx_b, :3, :4]
 
-    mask_a_t = torch.tensor(masks[idx_a], dtype=torch.float32, device=device)
-    mask_b_t = torch.tensor(masks[idx_b], dtype=torch.float32, device=device)
-    water_coords_a = (mask_a_t > 0.5).nonzero(as_tuple=False)  # (N_wa, 2) [row, col]
-    water_coords_b = (mask_b_t > 0.5).nonzero(as_tuple=False)
-    del mask_a_t, mask_b_t  # free mask tensors
-
-    if len(water_coords_a) < 10 or len(water_coords_b) < 10:
+    water_a = (torch.tensor(masks[idx_a], dtype=torch.float32, device=device) > 0.5).nonzero()
+    water_b = (torch.tensor(masks[idx_b], dtype=torch.float32, device=device) > 0.5).nonzero()
+    if len(water_a) < 10 or len(water_b) < 10:
         return torch.tensor(0.0, device=device), 0
 
-    # Subsample N_consist water pixels from each view
-    n_a = min(N_consist, len(water_coords_a))
-    n_b = min(N_consist, len(water_coords_b))
-    perm_a = torch.randperm(len(water_coords_a), device=device)[:n_a]
-    perm_b = torch.randperm(len(water_coords_b), device=device)[:n_b]
-    coords_a = water_coords_a[perm_a]  # (n_a, 2) long
-    coords_b = water_coords_b[perm_b]  # (n_b, 2) long
-    del water_coords_a, water_coords_b
+    coords_a = water_a[torch.randperm(len(water_a), device=device)[: min(N_consist, len(water_a))]]
+    coords_b = water_b[torch.randperm(len(water_b), device=device)[: min(N_consist, len(water_b))]]
 
-    # Build ray batches with 9-neighbor structure
-    rays_o_a, rays_d_a = get_rays(H, W, K, pose_a)  # (H, W, 3) world-space
-    batch_rays_a = build_consistency_rays(rays_o_a, rays_d_a, coords_a, H, W)
-    del rays_o_a, rays_d_a  # free full-image ray maps
+    # the chunk size changes the random draws, so it stays as in the thesis runs
+    chunk = min(chunk, 9 * len(coords_a))
+    P_a = render_water_points(pose_a, coords_a, H, W, K, render_kwargs, chunk)
+    P_b = render_water_points(pose_b, coords_b, H, W, K, render_kwargs, chunk)
 
-    rays_o_b, rays_d_b = get_rays(H, W, K, pose_b)
-    batch_rays_b = build_consistency_rays(rays_o_b, rays_d_b, coords_b, H, W)
-    del rays_o_b, rays_d_b
+    focal = float(K[0][0])
+    proj_ab, in_view_ab = project_to_view(P_a, pose_b, focal, H, W)
+    proj_ba, in_view_ba = project_to_view(P_b, pose_a, focal, H, W)
+    loss_ab, n_ab = match_points(proj_ab, in_view_ab, P_a, coords_b, P_b)
+    loss_ba, n_ba = match_points(proj_ba, in_view_ba, P_b, coords_a, P_a)
+    return loss_ab + loss_ba, n_ab + n_ba
 
-    wm_a = torch.ones(n_a, device=device)
-    wm_b = torch.ones(n_b, device=device)
 
-    # Render both batches through full pipeline
-    consist_chunk = min(chunk, n_a * 9)
-    rgb_a, _, _, Xs_a, depth_a, sray_a, extras_a = render(
-        H,
-        W,
-        K,
-        chunk=consist_chunk,
-        rays=batch_rays_a,
-        pixel_water_mask=wm_a,
-        **render_kwargs,
-    )
-    del batch_rays_a, wm_a, rgb_a, extras_a  # free intermediates
-
-    rgb_b, _, _, Xs_b, depth_b, sray_b, extras_b = render(
-        H,
-        W,
-        K,
-        chunk=consist_chunk,
-        rays=batch_rays_b,
-        pixel_water_mask=wm_b,
-        **render_kwargs,
-    )
-    del batch_rays_b, wm_b, rgb_b, extras_b
-
-    # Compute 3D underwater points in NDC: P_ndc = Xs + depth * sample_ray
-    P_ndc_a = Xs_a + depth_a.unsqueeze(-1) * sray_a  # (n_a, 3)
-    P_ndc_b = Xs_b + depth_b.unsqueeze(-1) * sray_b  # (n_b, 3)
-
-    # Convert NDC to NeRF world coordinates
-    model = render_kwargs["network_fn"]
-    P_world_a = model.ndcp2camp(P_ndc_a, W=W, H=H, f=focal)  # (n_a, 3)
-    P_world_b = model.ndcp2camp(P_ndc_b, W=W, H=H, f=focal)  # (n_b, 3)
-
-    # Project A's 3D points into B's image plane
-    R_b = pose_b[:3, :3]  # (3, 3)
-    t_b = pose_b[:3, 3]  # (3,)
-    # World-to-camera: P_cam = R^T @ (P - t) = (P - t) @ R
-    P_cam_inB = (P_world_a - t_b.unsqueeze(0)) @ R_b  # (n_a, 3)
-    # Pinhole projection (NeRF: camera looks in -Z)
-    valid_front_ab = P_cam_inB[:, 2] < -1e-6
-    u_b = focal * P_cam_inB[:, 0] / (-P_cam_inB[:, 2]) + W * 0.5
-    # get_rays() uses Y_cam = -(j - cy)/fy, so inverse is j = -f*Y/(-Z) + H/2
-    v_b = -focal * P_cam_inB[:, 1] / (-P_cam_inB[:, 2]) + H * 0.5
-    valid_bounds_ab = (u_b >= 0) & (u_b < W) & (v_b >= 0) & (v_b < H)
-    valid_ab = valid_front_ab & valid_bounds_ab
-
-    # Project B's 3D points into A's image plane
-    R_a = pose_a[:3, :3]
-    t_a = pose_a[:3, 3]
-    P_cam_inA = (P_world_b - t_a.unsqueeze(0)) @ R_a
-    valid_front_ba = P_cam_inA[:, 2] < -1e-6
-    u_a = focal * P_cam_inA[:, 0] / (-P_cam_inA[:, 2]) + W * 0.5
-    # get_rays() uses Y_cam = -(j - cy)/fy, so inverse is j = -f*Y/(-Z) + H/2
-    v_a = -focal * P_cam_inA[:, 1] / (-P_cam_inA[:, 2]) + H * 0.5
-    valid_bounds_ba = (u_a >= 0) & (u_a < W) & (v_a >= 0) & (v_a < H)
-    valid_ba = valid_front_ba & valid_bounds_ba
-
-    # Match projected pixels to nearest rendered pixels, compute loss
-    max_pixel_dist = 15.0
-    loss = torch.tensor(0.0, device=device)
-    n_pairs = 0
-
-    # A -> B direction
-    if valid_ab.sum() > 0:
-        # Projected A pixels in B's image: (row, col)
-        proj_ab = torch.stack([v_b[valid_ab], u_b[valid_ab]], dim=-1)  # (N_v, 2)
-        coords_b_float = coords_b.float()  # (n_b, 2) [row, col]
-        # Pairwise pixel distance
-        dists_ab = torch.cdist(proj_ab, coords_b_float)  # (N_v, n_b)
-        nn_dist_ab, nn_idx_ab = dists_ab.min(dim=1)  # (N_v,)
-        close_ab = nn_dist_ab < max_pixel_dist
-
-        if close_ab.sum() > 0:
-            matched_P_b = P_world_b[nn_idx_ab[close_ab]]
-            source_P_a = P_world_a[valid_ab][close_ab]
-            loss = loss + torch.mean((source_P_a - matched_P_b) ** 2)
-            n_pairs += int(close_ab.sum().item())
-
-    # B -> A direction (symmetric)
-    if valid_ba.sum() > 0:
-        proj_ba = torch.stack([v_a[valid_ba], u_a[valid_ba]], dim=-1)
-        coords_a_float = coords_a.float()
-        dists_ba = torch.cdist(proj_ba, coords_a_float)
-        nn_dist_ba, nn_idx_ba = dists_ba.min(dim=1)
-        close_ba = nn_dist_ba < max_pixel_dist
-
-        if close_ba.sum() > 0:
-            matched_P_a = P_world_a[nn_idx_ba[close_ba]]
-            source_P_b = P_world_b[valid_ba][close_ba]
-            loss = loss + torch.mean((source_P_b - matched_P_a) ** 2)
-            n_pairs += int(close_ba.sum().item())
-
-    return loss, n_pairs
+def ramp(weight, warmup, step):
+    return weight * min(step / warmup, 1.0) if warmup > 0 else weight
 
 
 def batchify(fn, chunk):
@@ -267,13 +161,9 @@ def run_network(rays_o, viewdirs, water_mask, fn, netchunk=1024, N_samples=None,
     return outputs, Xs, z_vals, sample_ray, dD
 
 
-def batchify_rays(rays_flat, chunk=1024 * 32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024 * 32, water_mask=None, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
-
-    # Extract water_mask from kwargs so we can slice it per-chunk
-    water_mask = kwargs.pop("water_mask", None)
-
     for i in range(0, rays_flat.shape[0], chunk):
         wm_chunk = water_mask[i: i + chunk] if water_mask is not None else None
         ret = render_rays(rays_flat[i: i + chunk], water_mask=wm_chunk, **kwargs)
@@ -301,41 +191,14 @@ def render(
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
 
-        rays_od = torch.cat([rays_o.unsqueeze(0), rays_d.unsqueeze(0)], dim=0)
-        rays_od = rays_od.permute([1, 2, 0, 3])
-        rays_od = rays_od[:, :, None, :, :]
-
-        # Vectorized neighbor gathering
-        # Reminder: rays_od shape: [H, W, 1, 2, 3]
-        H_img, W_img = rays_od.shape[0], rays_od.shape[1]
-
-        # Squeeze to [H, W, 2, 3] and rearrange to [2, 3, H, W] for padding
-        rays_squeezed = rays_od.squeeze(2)
-        rays_permuted = rays_squeezed.permute(2, 3, 0, 1)
-
-        # Pad with replicate mode
-        rays_padded = F.pad(rays_permuted, (1, 1, 1, 1), mode="replicate")  # [2, 3, H+2, W+2]
-        rays_padded = rays_padded.permute(2, 3, 0, 1)  # [H+2, W+2, 2, 3]
-
-        # Gather center + 8 neighbors using vectorized slicing with original order
-        neighbors = [
-            rays_squeezed,  # Center
-            rays_padded[0: H_img, 0: W_img, :, :],  # top-left
-            rays_padded[0: H_img, 1: W_img + 1, :, :],  # top
-            rays_padded[0: H_img, 2: W_img + 2, :, :],  # top-right
-            rays_padded[1: H_img + 1, 0: W_img, :, :],  # left
-            rays_padded[1: H_img + 1, 2: W_img + 2, :, :],  # right
-            rays_padded[2: H_img + 2, 0: W_img, :, :],  # bottom-left
-            rays_padded[2: H_img + 2, 1: W_img + 1, :, :],  # bottom
-            rays_padded[2: H_img + 2, 2: W_img + 2, :, :],  # bottom-right
-        ]
-
-        rays_od = torch.stack(neighbors, dim=2) # [H, W, 9, 2, 3]
-
-        rays_od = rays_od.view([-1, 2, 3])
-        rays_o, rays_d = torch.split(rays_od, [1, 1], dim=-2)
-        rays_o = rays_o.squeeze()
-        rays_d = rays_d.squeeze()
+        rays_od = torch.stack([rays_o, rays_d], dim=2)  # [H, W, 2, 3]
+        padded = F.pad(rays_od.permute(2, 3, 0, 1), (1, 1, 1, 1), mode="replicate")
+        padded = padded.permute(2, 3, 0, 1)  # [H+2, W+2, 2, 3]
+        rays_od = torch.stack(
+            [padded[1 + dh : 1 + dh + H, 1 + dw : 1 + dw + W] for dh, dw in NEIGHBOR_OFFSETS],
+            dim=2,
+        )  # [H, W, 9, 2, 3]
+        rays_o, rays_d = rays_od[..., 0, :], rays_od[..., 1, :]
     else:
         # use provided ray batch
         rays_o, rays_d = rays
@@ -349,12 +212,7 @@ def render(
 
     rays = torch.cat([rays_o, rays_d], -1)
 
-    # Build per-ray water_mask for batchify_rays
-    if pixel_water_mask is not None:
-        kwargs["water_mask"] = pixel_water_mask
-
-    # Render
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, water_mask=pixel_water_mask, **kwargs)
 
     k_extract = ["rgb_map", "disp_map", "acc_map", "Xs", "depth_map", "sample_ray"]
     ret_list = [all_ret[k] for k in k_extract]
@@ -381,16 +239,12 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         lpips_model = util_of_lpips(net="vgg")
 
     for i, c2w in enumerate(tqdm(render_poses)):
-        # Build per-pixel water mask for this image
+        mask_i = None
         pwm = None
-        if masks is not None and i < len(masks):
+        if masks is not None:
             mask_i = masks[i]
-            if mask_i.ndim == 3:
-                mask_i = mask_i[:, :, 0]
-            # Resize if render_factor changed H, W
-            if mask_i.shape[0] != H or mask_i.shape[1] != W:
-                from skimage.transform import resize
-
+            # resize if render_factor changed H, W
+            if mask_i.shape != (H, W):
                 mask_i = resize(mask_i, (H, W), order=0, preserve_range=True)
             pwm = torch.tensor(
                 (mask_i.reshape(-1) > 0.5).astype(np.float32), device=c2w.device
@@ -429,18 +283,8 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             imageio.imwrite(filename, rgb8)
 
             # --- Save masked ---
-            if masks is not None and i < len(masks):
-                mask = masks[i]
-                if mask.ndim == 3:
-                    mask = mask[:, :, 0]  # Take first channel if multi-channel
-                # Resize mask
-                if mask.shape[0] != H or mask.shape[1] != W:
-                    from skimage.transform import resize
-
-                    mask = resize(mask, (H, W), order=0, preserve_range=True)
-
-                # Create masked RGB
-                mask_binary = (mask > 0.5).astype(np.float32)
+            if mask_i is not None:
+                mask_binary = (mask_i > 0.5).astype(np.float32)
                 rgb_masked = rgb8.copy()
                 rgb_masked[mask_binary < 0.5] = 0  # Black outside
 
@@ -693,21 +537,19 @@ def render_rays(
         raw, z_vals, sample_ray, raw_noise_std, white_bkgd
     )
 
-    ret = {
+    return {
         "rgb_map": rgb_map,
         "disp_map": disp_map,
         "acc_map": acc_map,
         "Xs": Xs,
         "sample_ray": sample_ray,
         "dD": dD,
+        "depth_map": depth_map,
+        "depth_mode": depth_mode,
+        "water_mask": wm,
+        "weights": weights,
+        "z_vals": z_vals,
     }
-    ret["depth_map"] = depth_map
-    ret["depth_mode"] = depth_mode  # NEW
-    ret["water_mask"] = wm
-    ret["weights"] = weights
-    ret["z_vals"] = z_vals
-
-    return ret
 
 
 def config_parser():
@@ -1104,11 +946,9 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(
         args
     )
-    if hasattr(torch, "compile"):
-        model = render_kwargs_train["network_fn"]
-        if hasattr(model, "_occ"):
-            model._occ = torch.compile(model._occ, mode="default")
-            model._occfine = torch.compile(model._occfine, mode="default")
+    model = render_kwargs_train["network_fn"]
+    model._occ = torch.compile(model._occ, mode="default")
+    model._occfine = torch.compile(model._occfine, mode="default")
     global_step = start
 
     # Move testing data to GPU
@@ -1206,25 +1046,14 @@ def train():
     print("Arranging neighbor rays for all training pixels...")
     filtered_rays_list = []
     water_flags_list = []
-    for n in range(len(rays_rgb)):
-        if n not in i_train:
-            continue
-        img_rays = rays_rgb[n]  # [H, W, 3, 3]
+    for n in i_train:
         # without masks, follow --water like render_rays does
         mask_n = masks[n] if use_masks else np.full((H, W), float(args.water == 1))
-        padded = np.pad(img_rays, ((1, 1), (1, 1), (0, 0), (0, 0)), mode='edge')
-        # All 9 neighbors via slicing — shape (H, W, 9, 3, 3)
-        neighbors = np.stack([
-            padded[1:H + 1, 1:W + 1],  # 0: center
-            padded[0:H, 0:W],  # 1: top-left
-            padded[0:H, 1:W + 1],  # 2: top
-            padded[0:H, 2:W + 2],  # 3: top-right
-            padded[1:H + 1, 0:W],  # 4: left
-            padded[1:H + 1, 2:W + 2],  # 5: right
-            padded[2:H + 2, 0:W],  # 6: bottom-left
-            padded[2:H + 2, 1:W + 1],  # 7: bottom
-            padded[2:H + 2, 2:W + 2],  # 8: bottom-right
-        ], axis=2)
+        padded = np.pad(rays_rgb[n], ((1, 1), (1, 1), (0, 0), (0, 0)), mode="edge")
+        neighbors = np.stack(
+            [padded[1 + dh : 1 + dh + H, 1 + dw : 1 + dw + W] for dh, dw in NEIGHBOR_OFFSETS],
+            axis=2,
+        )  # [H, W, 9, ro+rd+rgb, 3]
         filtered_rays_list.append(neighbors.reshape(-1, 9, 3, 3))
         water_flags_list.append((mask_n.reshape(-1) > 0.5).astype(np.float32))
     rays_rgb = np.concatenate(filtered_rays_list, axis=0)  # [N_total, 9, 3, 3]
@@ -1294,55 +1123,27 @@ def train():
         model = render_kwargs_train["network_fn"]
         dD_out = extras["dD"]
         dD_reshaped = dD_out.view(-1, 9)
+        water_rays = extras["water_mask"] > 0.5
         smooth_loss = torch.tensor(0.0, device=device)
-        if args.water == 1 and args.smooth_weight > 0:
-            # Only compute smoothness loss on water rays
-            wm_out = extras.get("water_mask", None)
-            if wm_out is not None:
-                water_ray_mask = wm_out > 0.5  # (N_rays,)
-                if water_ray_mask.any():
-                    dD_water = dD_reshaped[water_ray_mask]
-                    smooth_loss = torch.mean(model.smooth(dD_water))
-            else:
-                # Fallback: all rays treated as water (backup)
-                smooth_loss = torch.mean(model.smooth(dD_reshaped))
-
-        effective_smooth_weight = args.smooth_weight
-        if args.smooth_warmup > 0 and global_step < args.smooth_warmup:
-            effective_smooth_weight = args.smooth_weight * (
-                global_step / args.smooth_warmup
-            )
-
+        if args.water == 1 and args.smooth_weight > 0 and water_rays.any():
+            smooth_loss = torch.mean(model.smooth(dD_reshaped[water_rays]))
+        effective_smooth_weight = ramp(args.smooth_weight, args.smooth_warmup, global_step)
         loss = img_loss + effective_smooth_weight * smooth_loss
 
-        # Flatness loss
         flat_loss = torch.tensor(0.0, device=device)
         effective_flat_weight = 0.0
-        if args.flatness_weight > 0 and Xs is not None:
-            wm_out = extras.get("water_mask", None)
-            if wm_out is not None:
-                water_mask = wm_out > 0.5
-                if water_mask.sum() > 1:
-                    Xs_water_z = Xs[water_mask, 2]
-                    flat_loss = torch.var(Xs_water_z)
-            elif Xs.shape[0] > 1:
-                flat_loss = torch.var(Xs[:, 2])
-            if args.flatness_warmup > 0 and global_step < args.flatness_warmup:
-                effective_flat_weight = args.flatness_weight * (global_step / args.flatness_warmup)
-            else:
-                effective_flat_weight = args.flatness_weight
+        if args.flatness_weight > 0:
+            # the variance of a single value is NaN
+            if water_rays.sum() > 1:
+                flat_loss = torch.var(Xs[water_rays, 2])
+            effective_flat_weight = ramp(args.flatness_weight, args.flatness_warmup, global_step)
             loss = loss + effective_flat_weight * flat_loss
 
         # Distortion loss (Mip-NeRF 360)
         dist_loss = torch.tensor(0.0, device=device)
         effective_dist_weight = 0.0
         if args.distortion_weight > 0:
-            if global_step < args.distortion_warmup:
-                effective_dist_weight = args.distortion_weight * (
-                        global_step / args.distortion_warmup
-                )
-            else:
-                effective_dist_weight = args.distortion_weight
+            effective_dist_weight = ramp(args.distortion_weight, args.distortion_warmup, global_step)
             dist_loss = distortion_loss(extras["weights"], extras["z_vals"])
             loss = loss + effective_dist_weight * dist_loss
 
@@ -1359,12 +1160,7 @@ def train():
             and i % args.consistency_every == 0
             and i > 0
         ):
-            if i < args.consistency_warmup:
-                effective_consist_weight = args.consistency_weight * (
-                    i / args.consistency_warmup
-                )
-            else:
-                effective_consist_weight = args.consistency_weight
+            effective_consist_weight = ramp(args.consistency_weight, args.consistency_warmup, i)
 
             try:
                 consistency_loss, n_consist_pairs = compute_consistency_loss(
@@ -1420,7 +1216,6 @@ def train():
 
         if not torch.isfinite(loss):
             tqdm.write(f"Iter {i:,}: non-finite loss ({loss.item():.4f}), batch skipped")
-            optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if args.grad_clip > 0:
@@ -1487,18 +1282,10 @@ def train():
             dD_info = ""
             if args.water == 1:
                 dD_info = f"  dD mean {dD_out.abs().mean().item():.6f} max {dD_out.abs().max().item():.4f}"
-            smooth_val = (
-                smooth_loss.item()
-                if isinstance(smooth_loss, torch.Tensor)
-                else smooth_loss
-            )
+            smooth_val = smooth_loss.item()
             consist_info = ""
             if args.consistency_weight > 0:
-                consist_val = (
-                    consistency_loss.item()
-                    if isinstance(consistency_loss, torch.Tensor)
-                    else consistency_loss
-                )
+                consist_val = consistency_loss.item()
                 consist_info = f"  consistency {consist_val:.6f} ({n_consist_pairs:,} pairs)"
             tqdm.write(
                 f"Iter {i:,}  loss {loss.item():.6f}  psnr {psnr.item():.3f}  "
