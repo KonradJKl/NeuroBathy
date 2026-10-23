@@ -64,8 +64,8 @@ points vertically by the median offset between the highest 10% of its water poin
 the WSM.
 
 The georeferencing has its own error. Fitting the camera centres to the GPS positions
-leaves an XY residual of 0.17 m for NeRFrac on the oblique images, 0.10 m on the 280
-images and 0.69 m for VGGT, see [`data/transforms`](data/transforms).
+leaves a horizontal residual (RMS) of 0.24 m for NeRFrac on the oblique images, 0.14 m
+on the 280 images and 0.97 m for VGGT, see [`data/transforms`](data/transforms).
 
 ## Findings
 
@@ -261,8 +261,9 @@ control points.
 - NeRFrac has no metric depth supervision. The nadir models overpredict depth by a
   factor of up to 34 and need a scale correction fitted on ground truth. With oblique
   views the factor is 1.2 to 3.0.
-- VGGT's camera estimates break down on the oblique and 280-image sets (XY residuals of
-  13-16 m after georeferencing), so the table only shows VGGT on the 9 nadir images.
+- VGGT's camera estimates break down on the oblique and 280-image sets (horizontal
+  residuals of 18-22 m after georeferencing), so the table only shows VGGT on the 9
+  nadir images.
 - All numbers come from one river with dense ground truth.
 
 Not included yet: the configurations and image lists of the models in the table, tests,

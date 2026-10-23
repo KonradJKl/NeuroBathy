@@ -7,6 +7,7 @@ import glob
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -65,21 +66,24 @@ def read_exif_gps(image_path):
     try:
         lat = _dms_to_decimal(gps["GPSLatitude"], gps["GPSLatitudeRef"])
         lon = _dms_to_decimal(gps["GPSLongitude"], gps["GPSLongitudeRef"])
-        alt = float(gps.get("GPSAltitude", 0))
+        # without a height the image cannot enter the 3D fit
+        alt = float(gps["GPSAltitude"])
         alt_ref = gps.get("GPSAltitudeRef", b"\x00")
         if isinstance(alt_ref, bytes) and alt_ref == b"\x01":
             alt = -alt
         elif isinstance(alt_ref, int) and alt_ref == 1:
             alt = -alt
-        return (lat, lon, alt)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, IndexError, ZeroDivisionError):
         return None
+    if lat == 0 and lon == 0:  # the placeholder of a camera without a fix
+        return None
+    return (lat, lon, alt)
 
 
-def read_all_exif_gps(image_dir, extensions=(".JPG", ".jpg", ".jpeg", ".png")):
+def read_all_exif_gps(image_dir, extensions=(".jpg", ".jpeg", ".png")):
     gps_dict = {}
     for fname in sorted(os.listdir(image_dir)):
-        if not any(fname.endswith(ext) for ext in extensions):
+        if os.path.splitext(fname)[1].lower() not in extensions:
             continue
         result = read_exif_gps(os.path.join(image_dir, fname))
         if result is not None:
@@ -88,102 +92,25 @@ def read_all_exif_gps(image_dir, extensions=(".JPG", ".jpg", ".jpeg", ".png")):
 
 
 def extract_gps_from_colmap_db(db_path):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT name, prior_tx, prior_ty, prior_tz FROM images "
-        "WHERE prior_tx IS NOT NULL"
-    )
-    rows = cursor.fetchall()
+    # read-only, so that the WAL of a COLMAP project is not written into its database
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    rows = conn.execute(
+        "SELECT name, prior_tx, prior_ty, prior_tz FROM images WHERE prior_tx IS NOT "
+        "NULL AND prior_ty IS NOT NULL AND prior_tz IS NOT NULL"
+    ).fetchall()
     conn.close()
-
-    gps = {}
-    for name, lat, lon, alt in rows:
-        if lat is not None and lon is not None and alt is not None:
-            gps[name] = np.array([lat, lon, alt])
-    return gps
-
-_wgs84_to_utm33_transformer = None
+    return {name: np.array([lat, lon, alt]) for name, lat, lon, alt in rows}
 
 
-def _get_wgs84_to_utm33():
-    global _wgs84_to_utm33_transformer
-    if _wgs84_to_utm33_transformer is None:
-        _wgs84_to_utm33_transformer = Transformer.from_crs(
-            "EPSG:4326", "EPSG:25833", always_xy=False
-        )
-    return _wgs84_to_utm33_transformer
-
-
-def wgs84_to_utm33(lat, lon, alt=0.0):
-    t = _get_wgs84_to_utm33()
-    easting, northing = t.transform(lat, lon)
-    return np.array([easting, northing, alt])
-
-
-def wgs84_dict_to_utm33(gps_dict):
-    t = _get_wgs84_to_utm33()
-    utm = {}
-    for name, (lat, lon, alt) in gps_dict.items():
-        easting, northing = t.transform(lat, lon)
-        utm[name] = np.array([easting, northing, alt])
-    return utm
-
-
-
-_wgs84_to_utm34_transformer = None
-
-
-def _get_wgs84_to_utm34():
-    global _wgs84_to_utm34_transformer
-    if _wgs84_to_utm34_transformer is None:
-        _wgs84_to_utm34_transformer = Transformer.from_crs(
-            "EPSG:4326", "EPSG:32634", always_xy=False
-        )
-    return _wgs84_to_utm34_transformer
-
-
-def wgs84_to_utm34(lat, lon, alt=0.0):
-    t = _get_wgs84_to_utm34()
-    easting, northing = t.transform(lat, lon)
-    return np.array([easting, northing, alt])
-
-
-def wgs84_dict_to_utm34(gps_dict):
-    t = _get_wgs84_to_utm34()
-    utm = {}
-    for name, (lat, lon, alt) in gps_dict.items():
-        easting, northing = t.transform(lat, lon)
-        utm[name] = np.array([easting, northing, alt])
-    return utm
-
-
-
-_wgs84_to_utm36_transformer = None
-
-
-def _get_wgs84_to_utm36():
-    global _wgs84_to_utm36_transformer
-    if _wgs84_to_utm36_transformer is None:
-        _wgs84_to_utm36_transformer = Transformer.from_crs(
-            "EPSG:4326", "EPSG:32636", always_xy=False
-        )
-    return _wgs84_to_utm36_transformer
-
-
-def wgs84_to_utm36(lat, lon, alt=0.0):
-    t = _get_wgs84_to_utm36()
-    easting, northing = t.transform(lat, lon)
-    return np.array([easting, northing, alt])
-
-
-def wgs84_dict_to_utm36(gps_dict):
-    t = _get_wgs84_to_utm36()
-    utm = {}
-    for name, (lat, lon, alt) in gps_dict.items():
-        easting, northing = t.transform(lat, lon)
-        utm[name] = np.array([easting, northing, alt])
-    return utm
+def wgs84_dict_to_projected(gps_dict, epsg):
+    """GPS (lat, lon, height) per name -> (easting, northing, height) in EPSG:epsg."""
+    # always_xy: easting first, also for CRSs whose axis order is northing, easting
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    projected = {}
+    for name, (lat, lon, height) in gps_dict.items():
+        easting, northing = transformer.transform(lon, lat)
+        projected[name] = np.array([easting, northing, height])
+    return projected
 
 
 def ndc_to_nerf_world(P_ndc, H, W, focal, near=1.0):
@@ -287,9 +214,10 @@ def compute_umeyama_residuals(source, target, s, R, t):
     transformed = apply_umeyama(source, s, R, t)
     residuals = transformed - target
 
-    xy_rms = np.sqrt(np.mean(residuals[:, :2] ** 2))
+    # RMS of the horizontal and of the 3D residual length
+    xy_rms = np.sqrt(np.mean(np.sum(residuals[:, :2] ** 2, axis=1)))
     z_rms = np.sqrt(np.mean(residuals[:, 2] ** 2))
-    total_rms = np.sqrt(np.mean(residuals**2))
+    total_rms = np.sqrt(np.mean(np.sum(residuals**2, axis=1)))
     max_xy = np.max(np.linalg.norm(residuals[:, :2], axis=1))
     max_z = np.max(np.abs(residuals[:, 2]))
 
@@ -299,20 +227,8 @@ def compute_umeyama_residuals(source, target, s, R, t):
         "total_rms": total_rms,
         "max_xy": max_xy,
         "max_z": max_z,
-        "residuals": residuals,
-        "transformed": transformed,
     }
 
-
-
-def sample_wsm(wsm_path, easting, northing):
-    with rasterio.open(wsm_path) as src:
-        row, col = src.index(easting, northing)
-        if 0 <= row < src.height and 0 <= col < src.width:
-            val = src.read(1)[row, col]
-            if val != src.nodata:
-                return float(val)
-    return None
 
 
 def sample_wsm_batch(wsm_path, eastings, northings):

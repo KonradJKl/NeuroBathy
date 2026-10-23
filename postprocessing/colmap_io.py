@@ -61,10 +61,10 @@ def read_colmap_images_binary(path):
             tvec = np.array(props[5:8])
             camera_id = props[8]
             # Read null-terminated name
-            name = ""
+            name = b""
             ch = _read_next_bytes(fid, 1, "c")[0]
             while ch != b"\x00":
-                name += ch.decode("utf-8")
+                name += ch
                 ch = _read_next_bytes(fid, 1, "c")[0]
             # Skip 2D points
             num_points2D = _read_next_bytes(fid, 8, "Q")[0]
@@ -74,7 +74,7 @@ def read_colmap_images_binary(path):
                 qvec=qvec,
                 tvec=tvec,
                 camera_id=camera_id,
-                name=name,
+                name=name.decode("utf-8"),
             )
     return images
 
