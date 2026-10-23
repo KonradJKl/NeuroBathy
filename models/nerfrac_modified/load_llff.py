@@ -1,10 +1,22 @@
 import imageio
 import os
+import shutil
+import subprocess
 import numpy as np
 
 
 ########## Slightly modified version of LLFF data loading code 
 ##########  see https://github.com/Fyusion/LLFF for original
+
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+
+
+def _image_files(imgdir):
+    """The image file names of a folder, sorted, without hidden files."""
+    return [f for f in sorted(os.listdir(imgdir))
+            if not f.startswith('.') and f.lower().endswith(IMAGE_EXTENSIONS)
+            and os.path.isfile(os.path.join(imgdir, f))]
+
 
 def _minify(basedir, factors=[], resolutions=[]):
     needtoload = False
@@ -19,14 +31,11 @@ def _minify(basedir, factors=[], resolutions=[]):
     if not needtoload:
         return
 
-    from subprocess import check_output
-
     imgdir = os.path.join(basedir, 'images')
-    imgs = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir))]
-    imgs = [f for f in imgs if any([f.endswith(ex) for ex in ['JPG', 'jpg', 'png', 'jpeg', 'PNG']])]
+    imgs = _image_files(imgdir)
+    if not imgs:
+        raise FileNotFoundError(f'No images in {imgdir}')
     imgdir_orig = imgdir
-
-    wd = os.getcwd()
 
     for r in factors + resolutions:
         if isinstance(r, int):
@@ -41,19 +50,22 @@ def _minify(basedir, factors=[], resolutions=[]):
 
         print('Minifying', r, basedir)
 
-        os.makedirs(imgdir)
-        check_output('cp {}/* {}'.format(imgdir_orig, imgdir), shell=True)
-
-        ext = imgs[0].split('.')[-1]
-        args = ' '.join(['mogrify', '-resize', resizearg, '-format', 'png', '*.{}'.format(ext)])
-        print(args)
-        os.chdir(imgdir)
-        check_output(args, shell=True)
-        os.chdir(wd)
-
-        if ext != 'png':
-            check_output('rm {}/*.{}'.format(imgdir, ext), shell=True)
-            print('Removed duplicates')
+        # built without a shell (paths with spaces) in a temporary folder that is renamed
+        # when done, so that a failed run leaves no half-built images_<factor>
+        tmpdir = imgdir + '.tmp'
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        os.makedirs(tmpdir)
+        try:
+            for f in imgs:
+                shutil.copy(os.path.join(imgdir_orig, f), tmpdir)
+            print(f'mogrify -resize {resizearg} -format png ({len(imgs)} images)')
+            subprocess.run(['mogrify', '-resize', resizearg, '-format', 'png', *imgs], cwd=tmpdir, check=True)
+            for f in imgs:
+                if not f.endswith('.png'):
+                    os.remove(os.path.join(tmpdir, f))
+            os.replace(tmpdir, imgdir)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         print('Done')
 
 
@@ -63,9 +75,9 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0])
     bds = poses_arr[:, -2:].transpose([1, 0])
 
-    img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
-            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
-    sh = imageio.v2.imread(img0).shape
+    def full_res_shape():
+        imgdir = os.path.join(basedir, 'images')
+        return imageio.v2.imread(os.path.join(imgdir, _image_files(imgdir)[0])).shape
 
     sfx = ''
 
@@ -74,11 +86,13 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         _minify(basedir, factors=[factor])
         factor = factor
     elif height is not None:
+        sh = full_res_shape()
         factor = sh[0] / float(height)
         width = int(sh[1] / factor)
         _minify(basedir, resolutions=[[height, width]])
         sfx = '_{}x{}'.format(width, height)
     elif width is not None:
+        sh = full_res_shape()
         factor = sh[1] / float(width)
         height = int(sh[0] / factor)
         _minify(basedir, resolutions=[[height, width]])
@@ -88,14 +102,13 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
 
     imgdir = os.path.join(basedir, 'images' + sfx)
     if not os.path.exists(imgdir):
-        print(imgdir, 'does not exist, returning')
-        return
+        raise FileNotFoundError(f'{imgdir} does not exist')
 
-    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles = [os.path.join(imgdir, f) for f in _image_files(imgdir)]
     print(imgfiles)
     if poses.shape[-1] != len(imgfiles):
-        print('Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]))
-        return
+        raise ValueError(f'{len(imgfiles)} images in {imgdir} but {poses.shape[-1]} poses '
+                         f'in poses_bounds.npy')
 
     sh = imageio.v2.imread(imgfiles[0]).shape
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
@@ -268,7 +281,9 @@ def _load_masks(basedir, factor=None, width=None, height=None):
         return None
 
     maskfiles = [os.path.join(maskdir, f) for f in sorted(os.listdir(maskdir))
-                 if f.endswith('png')]
+                 if f.endswith('png') and not f.startswith('.')]
+    if not maskfiles:
+        raise FileNotFoundError(f'No PNG masks in {maskdir}')
 
     print(f'Found {len(maskfiles)} mask files')
 
