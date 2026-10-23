@@ -16,6 +16,7 @@ Usage examples:
         --ft_path logs/<experiment>/200000.tar
 """
 
+import math
 import os
 import numpy as np
 import imageio
