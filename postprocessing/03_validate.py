@@ -1,27 +1,32 @@
 """
-Validate bathymetric depth predictions against ground truth.
+Validate predicted depths against the underwater survey of the Pielach data: the
+reference targets (U6-U13) and the transect points (QP*).
+
+The GT depth of a point is the WSM elevation at the point minus its surveyed bed
+elevation. Each GT point takes the depth of the nearest cell of the 02 grid within
+--max_dist. Writes comparison.csv (every GT point with its cell, if matched),
+summary.txt and stats.json (statistics for all points, the reference targets and the
+transect points) and up to four plots to --output_dir. 10, 11 and 14 read
+comparison.csv.
 
 Usage examples:
-    # Validate NeRFrac 50m
+    # NeRFrac 50m
     python 03_validate.py \\
         --pred_csv bathymetry/bathymetry_nerfrac_50m.csv \\
-        --wsm_path /path/to/WSM.tif \\
-        --ref_csv /path/to/underwater_reference_targets.csv \\
-        --transect_csv /path/to/underwater_transect_points.csv \\
-        --label "NeRFrac 50m (950k)" \\
+        --ref_csv ../data/gt/pielach/07_underwater_reference_targets/Pielach_20241024_underwater_reference_targets.csv \\
+        --transect_csv ../data/gt/pielach/08_underwater_transect_points/Pielach_20241024_underwater_transect_points.csv \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
+        --label "NeRFrac 50m" \\
         --output_dir validation/nerfrac_50m
 
-    # Validate VGGT 50m v1
+    # VGGT 50m
     python 03_validate.py \\
-        --pred_csv bathymetry/bathymetry_vggt_50m_v1.csv \\
-        --wsm_path /path/to/WSM.tif \\
-        --ref_csv /path/to/underwater_reference_targets.csv \\
-        --transect_csv /path/to/underwater_transect_points.csv \\
-        --label "VGGT 50m v1" \\
-        --output_dir validation/vggt_50m_v1
-
-    # Compare multiple models (run 03_validate.py once per model,
-    # then use the stats JSON files for cross-model comparison)
+        --pred_csv bathymetry/bathymetry_vggt_50m.csv \\
+        --ref_csv ../data/gt/pielach/07_underwater_reference_targets/Pielach_20241024_underwater_reference_targets.csv \\
+        --transect_csv ../data/gt/pielach/08_underwater_transect_points/Pielach_20241024_underwater_transect_points.csv \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
+        --label "VGGT 50m" \\
+        --output_dir validation/vggt_50m
 """
 
 import argparse
@@ -34,67 +39,96 @@ from collections import Counter
 
 import numpy as np
 
-from coord_utils import sample_wsm_batch
-
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from coord_utils import sample_wsm_batch
+
+# grid key, the suffix of a pred_* column of comparison.csv -> column of the 02 CSV
+PRED_COLUMNS = {
+    "depth_m": "depth_m",
+    "easting": "utm_easting",
+    "northing": "utm_northing",
+    "elevation": "utm_elevation",
+}
+COMPARISON_COLUMNS = [
+    "name",
+    "type",
+    "transect",
+    "gt_easting",
+    "gt_northing",
+    "gt_elevation",
+    "ws_elevation",
+    "gt_depth_m",
+    "pred_easting",
+    "pred_northing",
+    "pred_elevation",
+    "pred_depth_m",
+    "error_m",
+    "match_dist_m",
+    "matched",
+]
+MIN_HISTOGRAM_POINTS = 3
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Validate bathymetric depth predictions against ground truth."
+        description="Validate predicted depths against the Pielach underwater survey."
     )
 
-    # Predicted bathymetry
+    # prediction
     parser.add_argument(
         "--pred_csv",
         type=str,
         required=True,
-        help="Path to predicted bathymetry CSV from 02_extract_bathymetry.py",
+        help="gridded bathymetry CSV from 02_extract_bathymetry.py",
     )
 
-    # Ground truth
+    # ground truth
     parser.add_argument(
         "--ref_csv",
         type=str,
         required=True,
-        help="Path to underwater reference targets CSV (comma-separated)",
+        help="underwater reference targets: a header line, then name, easting, "
+        "northing and height in the first four columns",
     )
     parser.add_argument(
         "--transect_csv",
         type=str,
         required=True,
-        help="Path to underwater transect points CSV (comma-separated)",
+        help="underwater transect points, same columns; the transect is the name up "
+        "to the last underscore (QP15 for QP15_3)",
     )
     parser.add_argument(
         "--wsm_path",
         type=str,
         required=True,
-        help="Path to Water Surface Model GeoTIFF",
+        help="water surface model GeoTIFF; GT depth = WSM elevation - bed elevation",
     )
 
-    # Matching
+    # matching
     parser.add_argument(
         "--max_dist",
         type=float,
         default=2.0,
-        help="Maximum matching distance in meters (default: 2.0)",
+        help="largest distance in m from a GT point to its grid cell (default: 2.0)",
     )
 
-    # Output
+    # output
     parser.add_argument(
         "--label",
         type=str,
         default="",
-        help="Human-readable model label for plots/reports (e.g. 'NeRFrac 50m')",
+        help="model name for the plots, the summary and stats.json (default: the file "
+        "name of --pred_csv without its extension)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="validation",
-        help="Output directory for validation results (default: validation/)",
+        help="output folder (default: validation)",
     )
 
     args = parser.parse_args()
@@ -103,16 +137,17 @@ def parse_args():
     return args
 
 
-PRED_COLUMNS = {
-    "easting": "utm_easting",
-    "northing": "utm_northing",
-    "elevation": "utm_elevation",
-    "depth_m": "depth_m",
-}
+def natural_key(name):
+    return [int(t) if t.isdecimal() else t for t in re.split(r"(\d+)", name)]
+
+
+def cumulative_distance(easting, northing):
+    return np.concatenate(
+        [[0], np.cumsum(np.sqrt(np.diff(easting) ** 2 + np.diff(northing) ** 2))]
+    )
 
 
 def load_predicted_grid(csv_path):
-    """Load predicted bathymetry grid CSV from 02_extract_bathymetry.py."""
     data = np.genfromtxt(
         csv_path, delimiter=",", names=True, ndmin=1, encoding="utf-8-sig"
     )
@@ -123,34 +158,26 @@ def load_predicted_grid(csv_path):
     if len(data) == 0:
         print(f"ERROR: {csv_path} has no grid cells")
         sys.exit(1)
-    result = {key: data[col].copy() for key, col in PRED_COLUMNS.items()}
+    grid = {key: data[col] for key, col in PRED_COLUMNS.items()}
 
-    print(f"Loaded predicted grid: {len(data):,} cells from {csv_path}")
-    print(f"  Easting:  [{result['easting'].min():.2f}, {result['easting'].max():.2f}]")
+    depth = grid["depth_m"]
     print(
-        f"  Northing: [{result['northing'].min():.2f}, {result['northing'].max():.2f}]"
+        f"Predicted grid: {len(data):,} cells, depth {np.nanmin(depth):.3f} to "
+        f"{np.nanmax(depth):.3f} m (median {np.nanmedian(depth):.3f} m)"
     )
-    print(
-        f"  Depth:    [{result['depth_m'].min():.3f}, {result['depth_m'].max():.3f}] m"
-    )
-    print(f"  Depth median: {np.median(result['depth_m']):.3f} m")
-    return result
+    return grid
 
 
-def load_gt_reference_targets(csv_path):
-    """Load underwater reference target points (U6-U13).
+def read_survey_csv(csv_path):
+    """(name, easting, northing, elevation) per row of a Pielach survey CSV.
 
-    Format: comma-separated, columns: Point, Easting[m], Northing[m],
-    WGS84 Ellip. Height [m], Code
-
-    Handles Unicode right-to-left mark in U12 elevation field.
-
-    :return: list of dicts with keys: name, easting, northing, elevation, type
+    The U12 height in the reference targets ends in a stray U+202C (pop directional
+    formatting), so non-ASCII characters are dropped from the heights.
     """
-    points = []
-    with open(csv_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f, delimiter=",")
-        header = next(reader, None)
+    rows = []
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        next(reader, None)
         for row in reader:
             if not any(field.strip() for field in row):
                 continue
@@ -159,150 +186,111 @@ def load_gt_reference_targets(csv_path):
                     f"ERROR: {csv_path} line {reader.line_num} has fewer than 4 columns"
                 )
                 sys.exit(1)
-            name = row[0].strip()
-            easting = float(row[1].strip())
-            northing = float(row[2].strip())
-            height_str = row[3].strip().encode("ascii", "ignore").decode()
-            elevation = float(height_str)
-            points.append(
-                {
-                    "name": name,
-                    "easting": easting,
-                    "northing": northing,
-                    "elevation": elevation,
-                    "type": "reference_target",
-                }
-            )
-    print(f"Loaded {len(points)} reference target points from {csv_path}")
-    return points
+            name, easting, northing = (field.strip() for field in row[:3])
+            height = row[3].strip().encode("ascii", "ignore").decode()
+            rows.append((name, float(easting), float(northing), float(height)))
+    return rows
 
 
-def load_gt_transect_points(csv_path):
+def load_gt_points(ref_csv, transect_csv):
     points = []
-    with open(csv_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f, delimiter=",")
-        header = next(reader, None)
-        for row in reader:
-            if not any(field.strip() for field in row):
-                continue
-            if len(row) < 4:
-                print(
-                    f"ERROR: {csv_path} line {reader.line_num} has fewer than 4 columns"
-                )
-                sys.exit(1)
-            name = row[0].strip()
-            easting = float(row[1].strip())
-            northing = float(row[2].strip())
-            height_str = row[3].strip().encode("ascii", "ignore").decode()
-            elevation = float(height_str)
-            parts = name.rsplit("_", 1)
-            transect = parts[0] if len(parts) == 2 else name
+    for path, point_type in ((ref_csv, "reference_target"), (transect_csv, "transect")):
+        for name, easting, northing, elevation in read_survey_csv(path):
+            # transect points are named <transect>_<number>, e.g. QP15_3
+            transect = name.rsplit("_", 1)[0] if point_type == "transect" else ""
             points.append(
                 {
                     "name": name,
-                    "easting": easting,
-                    "northing": northing,
-                    "elevation": elevation,
+                    "type": point_type,
                     "transect": transect,
-                    "type": "transect",
+                    "gt_easting": easting,
+                    "gt_northing": northing,
+                    "gt_elevation": elevation,
                 }
             )
-    print(f"Loaded {len(points)} transect points from {csv_path}")
-    transects = sorted(set(p["transect"] for p in points))
-    print(f"  Transects: {transects}")
+
+    n_ref = sum(p["type"] == "reference_target" for p in points)
+    transects = sorted(
+        {p["transect"] for p in points if p["transect"]}, key=natural_key
+    )
+    names = f" ({', '.join(transects)})" if transects else ""
+    print(
+        f"GT: {n_ref} reference targets, {len(points) - n_ref} transect points{names}"
+    )
     return points
 
 
-def compute_gt_depths(gt_points, wsm_path):
-    eastings = np.array([p["easting"] for p in gt_points])
-    northings = np.array([p["northing"] for p in gt_points])
-    ws_elevations = sample_wsm_batch(wsm_path, eastings, northings)
+def add_gt_depths(gt_points, wsm_path):
+    """GT depth = WSM elevation at the point - bed elevation (NaN off the WSM)."""
+    ws_elevations = sample_wsm_batch(
+        wsm_path,
+        [p["gt_easting"] for p in gt_points],
+        [p["gt_northing"] for p in gt_points],
+    )
+    for pt, ws in zip(gt_points, ws_elevations):
+        pt["ws_elevation"] = float(ws)
+        pt["gt_depth_m"] = float(ws - pt["gt_elevation"])
 
-    n_valid = 0
-    for i, pt in enumerate(gt_points):
-        ws = ws_elevations[i]
-        pt["ws_elevation"] = float(ws) if np.isfinite(ws) else np.nan
-        if np.isfinite(ws):
-            pt["gt_depth_m"] = float(ws - pt["elevation"])
-            n_valid += 1
-        else:
-            pt["gt_depth_m"] = np.nan
+    depths = np.array([p["gt_depth_m"] for p in gt_points])
+    depths = depths[np.isfinite(depths)]
+    n_off = len(gt_points) - len(depths)
+    note = f", {n_off} off the WSM" if n_off else ""
+    print(f"GT depth for {len(depths)}/{len(gt_points)} points{note}")
+    if len(depths) > 0:
+        print(
+            f"  mean {np.mean(depths):.3f} m, median {np.median(depths):.3f} m, "
+            f"range {np.min(depths):.3f} to {np.max(depths):.3f} m"
+        )
+    for p in gt_points:
+        if p["type"] == "reference_target":
+            print(
+                f"  {p['name']:12s}  bed={p['gt_elevation']:.3f}  "
+                f"ws={p['ws_elevation']:.3f}  depth={p['gt_depth_m']:.3f} m"
+            )
 
-    print(f"  Computed GT depth for {n_valid}/{len(gt_points)} points")
-    return gt_points
 
-
-
-def match_gt_to_grid(gt_points, grid, max_dist_m=2.0):
-    grid_e = grid["easting"]
-    grid_n = grid["northing"]
-    results = []
-
+def match_gt_to_grid(gt_points, grid, max_dist_m):
+    """Every GT point with its nearest grid cell, matched within max_dist_m."""
+    matches = []
     for pt in gt_points:
-        dx = grid_e - pt["easting"]
-        dy = grid_n - pt["northing"]
+        dx = grid["easting"] - pt["gt_easting"]
+        dy = grid["northing"] - pt["gt_northing"]
         dists = np.sqrt(dx**2 + dy**2)
         i_min = np.argmin(dists)
         min_dist = float(dists[i_min])
+        matched = min_dist <= max_dist_m
+        match = {**pt, "match_dist_m": min_dist, "matched": matched}
+        for key in PRED_COLUMNS:
+            match[f"pred_{key}"] = float(grid[key][i_min]) if matched else np.nan
+        matches.append(match)
 
-        match = {
-            "name": pt["name"],
-            "type": pt.get("type", "unknown"),
-            "transect": pt.get("transect", ""),
-            "gt_easting": pt["easting"],
-            "gt_northing": pt["northing"],
-            "gt_elevation": pt["elevation"],
-            "ws_elevation": pt.get("ws_elevation", np.nan),
-            "gt_depth_m": pt.get("gt_depth_m", np.nan),
-            "match_dist_m": min_dist,
-        }
-
-        if min_dist <= max_dist_m:
-            match["matched"] = True
-            match["pred_depth_m"] = float(grid["depth_m"][i_min])
-            match["pred_easting"] = float(grid_e[i_min])
-            match["pred_northing"] = float(grid_n[i_min])
-            match["pred_elevation"] = float(grid["elevation"][i_min])
-            if "depth_std" in grid:
-                match["pred_depth_std"] = float(grid["depth_std"][i_min])
-            if "n_observations" in grid:
-                match["n_observations"] = int(grid["n_observations"][i_min])
-        else:
-            match["matched"] = False
-            match["pred_depth_m"] = np.nan
-            match["pred_easting"] = np.nan
-            match["pred_northing"] = np.nan
-            match["pred_elevation"] = np.nan
-
-        results.append(match)
-
-    n_matched = sum(1 for r in results if r["matched"])
+    unmatched = [m["match_dist_m"] for m in matches if not m["matched"]]
     print(
-        f"  Matched {n_matched}/{len(gt_points)} GT points (max_dist={max_dist_m:.1f}m)"
+        f"Matched {len(matches) - len(unmatched)}/{len(matches)} GT points within "
+        f"{max_dist_m} m"
     )
-
-    if n_matched < len(gt_points):
-        unmatched = [r for r in results if not r["matched"]]
-        dists_unmatched = [r["match_dist_m"] for r in unmatched]
+    if unmatched:
         print(
-            f"  Unmatched nearest distances: "
-            f"min={min(dists_unmatched):.2f}m, "
-            f"max={max(dists_unmatched):.2f}m"
+            f"  nearest cell of the unmatched points: {min(unmatched):.2f} to "
+            f"{max(unmatched):.2f} m"
         )
+    return matches
 
-    return results
 
-
-def compute_error_statistics(matches):
-    valid = [
+def valid_matches(matches):
+    """Matched points with a finite GT and predicted depth."""
+    return [
         m
         for m in matches
         if m["matched"]
-        and np.isfinite(m.get("gt_depth_m", np.nan))
-        and np.isfinite(m.get("pred_depth_m", np.nan))
+        and np.isfinite(m["gt_depth_m"])
+        and np.isfinite(m["pred_depth_m"])
     ]
 
-    if len(valid) == 0:
+
+def compute_error_statistics(matches):
+    valid = valid_matches(matches)
+    if not valid:
         return {"n_valid": 0}
 
     gt = np.array([m["gt_depth_m"] for m in valid])
@@ -313,12 +301,16 @@ def compute_error_statistics(matches):
     ss_res = np.sum(errors**2)
     ss_tot = np.sum((gt - np.mean(gt)) ** 2)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else np.nan
-
-    # Pearson correlation
     if len(valid) >= 2 and np.std(gt) > 1e-12 and np.std(pred) > 1e-12:
-        corr = float(np.corrcoef(gt, pred)[0, 1])
+        correlation = float(np.corrcoef(gt, pred)[0, 1])
     else:
-        corr = np.nan
+        correlation = np.nan
+    # mean(pred) / mean(GT), above 1 when the depths are overpredicted; 11 and 14
+    # scale by the median GT / predicted depth at the reference targets instead
+    if abs(np.mean(gt)) > 1e-12:
+        scale_factor = float(np.mean(pred) / np.mean(gt))
+    else:
+        scale_factor = np.nan
 
     return {
         "n_valid": len(valid),
@@ -327,7 +319,7 @@ def compute_error_statistics(matches):
         "bias": float(np.mean(errors)),
         "std_error": float(np.std(errors)),
         "r2": float(r2),
-        "correlation": corr,
+        "correlation": correlation,
         "gt_mean": float(np.mean(gt)),
         "gt_std": float(np.std(gt)),
         "gt_min": float(np.min(gt)),
@@ -339,141 +331,114 @@ def compute_error_statistics(matches):
         "max_abs_error": float(np.max(abs_errors)),
         "p50_abs_error": float(np.median(abs_errors)),
         "p90_abs_error": float(np.percentile(abs_errors, 90)),
-        "scale_factor": float(np.mean(pred) / np.mean(gt))
-        if abs(np.mean(gt)) > 1e-12
-        else np.nan,
+        "scale_factor": scale_factor,
     }
 
 
-# Write csv
-def save_comparison_csv(filepath, matches):
-    with open(filepath, "w", newline="") as f:
+def fmt(value):
+    return f"{value:.4f}" if np.isfinite(value) else ""
+
+
+def save_comparison_csv(path, matches):
+    with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                "name",
-                "type",
-                "transect",
-                "gt_easting",
-                "gt_northing",
-                "gt_elevation",
-                "ws_elevation",
-                "gt_depth_m",
-                "pred_easting",
-                "pred_northing",
-                "pred_elevation",
-                "pred_depth_m",
-                "error_m",
-                "match_dist_m",
-                "matched",
-            ]
-        )
+        writer.writerow(COMPARISON_COLUMNS)
         for m in matches:
-            gt_d = m.get("gt_depth_m", np.nan)
-            pred_d = m.get("pred_depth_m", np.nan)
-            error = (
-                pred_d - gt_d if (np.isfinite(pred_d) and np.isfinite(gt_d)) else np.nan
-            )
-
-            def _fmt(v, prec=4):
-                return f"{v:.{prec}f}" if np.isfinite(v) else ""
-
             writer.writerow(
                 [
                     m["name"],
                     m["type"],
-                    m.get("transect", ""),
-                    _fmt(m["gt_easting"]),
-                    _fmt(m["gt_northing"]),
-                    _fmt(m["gt_elevation"]),
-                    _fmt(m.get("ws_elevation", np.nan)),
-                    _fmt(gt_d),
-                    _fmt(m.get("pred_easting", np.nan)),
-                    _fmt(m.get("pred_northing", np.nan)),
-                    _fmt(m.get("pred_elevation", np.nan)),
-                    _fmt(pred_d),
-                    _fmt(error),
-                    _fmt(m["match_dist_m"]),
+                    m["transect"],
+                    fmt(m["gt_easting"]),
+                    fmt(m["gt_northing"]),
+                    fmt(m["gt_elevation"]),
+                    fmt(m["ws_elevation"]),
+                    fmt(m["gt_depth_m"]),
+                    fmt(m["pred_easting"]),
+                    fmt(m["pred_northing"]),
+                    fmt(m["pred_elevation"]),
+                    fmt(m["pred_depth_m"]),
+                    fmt(m["pred_depth_m"] - m["gt_depth_m"]),
+                    fmt(m["match_dist_m"]),
                     "yes" if m["matched"] else "no",
                 ]
             )
-    print(f"  Saved comparison CSV: {filepath}")
+    print(f"Saved: {path}")
 
 
-def format_summary(label, stats_all, stats_ref, stats_trans, n_total, n_matched):
-    """Format validation summary as text lines."""
-    lines = []
-    lines.append(f"Model: {label}")
-    lines.append(f"GT points total: {n_total}")
-    lines.append(f"  Matched: {n_matched}")
-    lines.append(f"  Unmatched: {n_total - n_matched}")
-    lines.append("")
-
-    for section_label, stats in [
+def write_summary(
+    path, label, stats_all, stats_ref, stats_transect, n_total, n_matched
+):
+    lines = [
+        f"Model: {label}",
+        f"GT points total: {n_total}",
+        f"  Matched: {n_matched}",
+        f"  Unmatched: {n_total - n_matched}",
+        "",
+    ]
+    for section, stats in [
         ("ALL POINTS", stats_all),
         ("REFERENCE TARGETS ONLY", stats_ref),
-        ("TRANSECT POINTS ONLY", stats_trans),
+        ("TRANSECT POINTS ONLY", stats_transect),
     ]:
-        lines.append(f"--- {section_label} ---")
+        lines.append(f"--- {section} ---")
         if stats["n_valid"] == 0:
-            lines.append("  No valid points")
-            lines.append("")
+            lines += ["  No valid points", ""]
             continue
-        lines.append(f"  N valid:      {stats['n_valid']}")
-        lines.append(f"  RMSE:         {stats['rmse']:.4f} m")
-        lines.append(f"  MAE:          {stats['mae']:.4f} m")
-        lines.append(f"  Bias:         {stats['bias']:+.4f} m")
-        lines.append(f"  Std error:    {stats['std_error']:.4f} m")
-        lines.append(f"  R2:           {stats['r2']:.4f}")
-        lines.append(f"  Correlation:  {stats['correlation']:.4f}")
-        lines.append(f"  Scale factor: {stats['scale_factor']:.3f}x")
-        lines.append(f"  Max |error|:  {stats['max_abs_error']:.4f} m")
-        lines.append(f"  P50 |error|:  {stats['p50_abs_error']:.4f} m")
-        lines.append(f"  P90 |error|:  {stats['p90_abs_error']:.4f} m")
-        lines.append(
-            f"  GT depth:     mean={stats['gt_mean']:.3f}, "
-            f"std={stats['gt_std']:.3f}, "
-            f"range=[{stats['gt_min']:.3f}, {stats['gt_max']:.3f}] m"
-        )
-        lines.append(
+        lines += [
+            f"  N valid:      {stats['n_valid']}",
+            f"  RMSE:         {stats['rmse']:.4f} m",
+            f"  MAE:          {stats['mae']:.4f} m",
+            f"  Bias:         {stats['bias']:+.4f} m",
+            f"  Std error:    {stats['std_error']:.4f} m",
+            f"  R2:           {stats['r2']:.4f}",
+            f"  Correlation:  {stats['correlation']:.4f}",
+            f"  Scale factor: {stats['scale_factor']:.3f}x",
+            f"  Max |error|:  {stats['max_abs_error']:.4f} m",
+            f"  P50 |error|:  {stats['p50_abs_error']:.4f} m",
+            f"  P90 |error|:  {stats['p90_abs_error']:.4f} m",
+            f"  GT depth:     mean={stats['gt_mean']:.3f}, std={stats['gt_std']:.3f}, "
+            f"range=[{stats['gt_min']:.3f}, {stats['gt_max']:.3f}] m",
             f"  Pred depth:   mean={stats['pred_mean']:.3f}, "
             f"std={stats['pred_std']:.3f}, "
-            f"range=[{stats['pred_min']:.3f}, {stats['pred_max']:.3f}] m"
-        )
-        lines.append("")
+            f"range=[{stats['pred_min']:.3f}, {stats['pred_max']:.3f}] m",
+            "",
+        ]
 
-    return lines
+    text = "\n".join(lines)
+    with open(path, "w") as f:
+        f.write(text + "\n")
+    print()
+    print(text)
+    print(f"Saved: {path}")
 
 
-def plot_scatter(matches, stats, label, filepath):
-    valid = [
-        m
-        for m in matches
-        if m["matched"]
-        and np.isfinite(m.get("gt_depth_m", np.nan))
-        and np.isfinite(m.get("pred_depth_m", np.nan))
-    ]
-    if len(valid) == 0:
-        print("  [WARN] No valid points for scatter plot")
+def save_figure(fig, path):
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
+def plot_scatter(matches, stats, label, path):
+    valid = valid_matches(matches)
+    if not valid:
+        print("No valid points, no scatter plot")
         return
 
     gt = np.array([m["gt_depth_m"] for m in valid])
     pred = np.array([m["pred_depth_m"] for m in valid])
-    types = [m["type"] for m in valid]
+    ref_mask = np.array([m["type"] == "reference_target" for m in valid])
+    transect_mask = ~ref_mask
 
     fig, ax = plt.subplots(figsize=(8, 8))
-
-    ref_mask = np.array([t == "reference_target" for t in types])
-    trans_mask = ~ref_mask
-
-    if np.any(trans_mask):
+    if np.any(transect_mask):
         ax.scatter(
-            gt[trans_mask],
-            pred[trans_mask],
+            gt[transect_mask],
+            pred[transect_mask],
             c="steelblue",
             alpha=0.5,
             s=20,
-            label=f"Transect ({np.sum(trans_mask)})",
+            label=f"Transect ({np.sum(transect_mask)})",
             edgecolors="none",
         )
     if np.any(ref_mask):
@@ -489,17 +454,9 @@ def plot_scatter(matches, stats, label, filepath):
             linewidths=0.5,
         )
 
-    all_vals = np.concatenate([gt, pred])
-    lim_min = all_vals.min() - 0.1
-    lim_max = all_vals.max() + 0.1
-    ax.plot(
-        [lim_min, lim_max],
-        [lim_min, lim_max],
-        "k--",
-        linewidth=1,
-        alpha=0.5,
-        label="1:1 line",
-    )
+    # bank points just above the WSM have negative GT depths
+    lims = [min(gt.min(), pred.min()) - 0.1, max(gt.max(), pred.max()) + 0.1]
+    ax.plot(lims, lims, "k--", linewidth=1, alpha=0.5, label="1:1 line")
 
     txt = (
         f"N = {stats['n_valid']}\n"
@@ -527,16 +484,9 @@ def plot_scatter(matches, stats, label, filepath):
     ax.legend(loc="lower right")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(lim_min, lim_max)
-    ax.set_ylim(lim_min, lim_max)
-
-    plt.savefig(filepath, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved scatter plot: {filepath}")
-
-
-def natural_key(name):
-    return [int(t) if t.isdecimal() else t for t in re.split(r"(\d+)", name)]
+    ax.set_xlim(*lims)
+    ax.set_ylim(*lims)
+    save_figure(fig, path)
 
 
 def along_transect(points):
@@ -560,7 +510,7 @@ def transect_panels(matches):
     """
     runs = []
     for m in matches:
-        if m["type"] == "transect" and m.get("transect"):
+        if m["type"] == "transect" and m["transect"]:
             if runs and runs[-1][0] == m["transect"]:
                 runs[-1][1].append(m)
             else:
@@ -569,6 +519,7 @@ def transect_panels(matches):
     for i, (name, _) in enumerate(runs):
         first_run.setdefault(name, i)
     runs.sort(key=lambda run: (natural_key(run[0]), first_run[run[0]]))
+
     n_runs = Counter(name for name, _ in runs)
     seen = Counter()
     panels = []
@@ -579,40 +530,33 @@ def transect_panels(matches):
     return panels
 
 
-def plot_transect_profiles(matches, label, filepath):
+def plot_transect_profiles(matches, label, path):
     panels = transect_panels(matches)
-    if len(panels) == 0:
-        print("  [WARN] No transect data for profiles")
+    if not panels:
+        print("No transect points, no transect plot")
         return
 
-    n_trans = len(panels)
-
-    ncols = min(4, n_trans)
-    nrows = int(np.ceil(n_trans / ncols))
+    ncols = min(4, len(panels))
+    nrows = int(np.ceil(len(panels) / ncols))
     fig, axes = plt.subplots(
         nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False
     )
 
-    for idx, (tname, pts) in enumerate(panels):
-        row = idx // ncols
-        col = idx % ncols
-        ax = axes[row, col]
-
-        eas = np.array([p["gt_easting"] for p in pts])
-        nor = np.array([p["gt_northing"] for p in pts])
-        seg_dist = np.sqrt(np.diff(eas) ** 2 + np.diff(nor) ** 2)
-        cum_dist = np.concatenate([[0], np.cumsum(seg_dist)])
-
+    for idx, (title, pts) in enumerate(panels):
+        ax = axes[idx // ncols, idx % ncols]
+        cum_dist = cumulative_distance(
+            np.array([p["gt_easting"] for p in pts]),
+            np.array([p["gt_northing"] for p in pts]),
+        )
         gt_elev = np.array([p["gt_elevation"] for p in pts])
-        ws_elev = np.array([p.get("ws_elevation", np.nan) for p in pts])
-        pred_depth = np.array([p.get("pred_depth_m", np.nan) for p in pts])
-        matched = np.array([p.get("matched", False) for p in pts])
+        ws_elev = np.array([p["ws_elevation"] for p in pts])
+        pred_depth = np.array([p["pred_depth_m"] for p in pts])
+        matched = np.array([p["matched"] for p in pts])
 
         ax.plot(
             cum_dist, gt_elev, "k-o", markersize=3, linewidth=1.5, label="GT riverbed"
         )
 
-        # Water surface
         ws_valid = np.isfinite(ws_elev)
         if np.any(ws_valid):
             ax.plot(
@@ -623,6 +567,8 @@ def plot_transect_profiles(matches, label, filepath):
                 label="Water surface",
             )
 
+        # the predicted bed at its depth below the GT water surface, the depth the
+        # statistics compare; 02's elevation of plane_fit runs can be metres off
         pred_valid = matched & np.isfinite(pred_depth) & np.isfinite(ws_elev)
         if np.any(pred_valid):
             pred_elev = ws_elev[pred_valid] - pred_depth[pred_valid]
@@ -635,27 +581,25 @@ def plot_transect_profiles(matches, label, filepath):
                 label="Predicted",
             )
 
-        ax.set_title(tname, fontsize=11)
+        ax.set_title(title, fontsize=11)
         ax.set_xlabel("Distance (m)", fontsize=9)
         ax.set_ylabel("Elevation (m)", fontsize=9)
         ax.legend(fontsize=7, loc="best")
         ax.grid(True, alpha=0.3)
         ax.tick_params(labelsize=8)
 
-    for idx in range(n_trans, nrows * ncols):
+    for idx in range(len(panels), nrows * ncols):
         axes[idx // ncols, idx % ncols].set_visible(False)
 
     fig.suptitle(f"Transect Profiles -- {label}", fontsize=14, y=1.01)
-    plt.tight_layout()
-    plt.savefig(filepath, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved transect profiles: {filepath}")
+    fig.tight_layout()
+    save_figure(fig, path)
 
 
-def plot_spatial_error_map(matches, grid, label, filepath):
+def plot_spatial_error_map(matches, grid, label, path):
     fig, ax = plt.subplots(figsize=(12, 10))
 
-    sc = ax.scatter(
+    cells = ax.scatter(
         grid["easting"],
         grid["northing"],
         c=grid["depth_m"],
@@ -665,24 +609,16 @@ def plot_spatial_error_map(matches, grid, label, filepath):
         vmin=np.nanpercentile(grid["depth_m"], 1),
         vmax=np.nanpercentile(grid["depth_m"], 99),
     )
-    cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
-    cbar.set_label("Predicted Depth (m)", fontsize=11)
+    depth_bar = fig.colorbar(cells, ax=ax, shrink=0.8, pad=0.02)
+    depth_bar.set_label("Predicted Depth (m)", fontsize=11)
 
-    valid = [
-        m
-        for m in matches
-        if m["matched"]
-        and np.isfinite(m.get("gt_depth_m", np.nan))
-        and np.isfinite(m.get("pred_depth_m", np.nan))
-    ]
+    valid = valid_matches(matches)
     if valid:
-        gt_e = np.array([m["gt_easting"] for m in valid])
-        gt_n = np.array([m["gt_northing"] for m in valid])
         errors = np.array([m["pred_depth_m"] - m["gt_depth_m"] for m in valid])
-        err_max = max(abs(errors.min()), abs(errors.max()), 0.5)
-        sc2 = ax.scatter(
-            gt_e,
-            gt_n,
+        err_max = max(np.abs(errors).max(), 0.5)
+        error_points = ax.scatter(
+            [m["gt_easting"] for m in valid],
+            [m["gt_northing"] for m in valid],
             c=errors,
             cmap="RdBu_r",
             s=30,
@@ -692,8 +628,8 @@ def plot_spatial_error_map(matches, grid, label, filepath):
             vmax=err_max,
             zorder=5,
         )
-        cbar2 = fig.colorbar(sc2, ax=ax, shrink=0.5, pad=0.08)
-        cbar2.set_label("Depth Error (pred - GT, m)", fontsize=10)
+        error_bar = fig.colorbar(error_points, ax=ax, shrink=0.5, pad=0.08)
+        error_bar.set_label("Depth Error (pred - GT, m)", fontsize=10)
 
     unmatched = [m for m in matches if not m["matched"]]
     if unmatched:
@@ -714,22 +650,13 @@ def plot_spatial_error_map(matches, grid, label, filepath):
     ax.set_title(f"Spatial Error Map -- {label}", fontsize=13)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
-
-    plt.savefig(filepath, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved spatial error map: {filepath}")
+    save_figure(fig, path)
 
 
-def plot_error_histogram(matches, stats, label, filepath):
-    valid = [
-        m
-        for m in matches
-        if m["matched"]
-        and np.isfinite(m.get("gt_depth_m", np.nan))
-        and np.isfinite(m.get("pred_depth_m", np.nan))
-    ]
-    if len(valid) < 3:
-        print("  [WARN] Too few points for error histogram")
+def plot_error_histogram(matches, stats, label, path):
+    valid = valid_matches(matches)
+    if len(valid) < MIN_HISTOGRAM_POINTS:
+        print(f"Fewer than {MIN_HISTOGRAM_POINTS} valid points, no error histogram")
         return
 
     errors = np.array([m["pred_depth_m"] - m["gt_depth_m"] for m in valid])
@@ -768,26 +695,11 @@ def plot_error_histogram(matches, stats, label, filepath):
         fontfamily="monospace",
         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
     )
-
-    plt.savefig(filepath, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved error histogram: {filepath}")
+    save_figure(fig, path)
 
 
 def main():
     args = parse_args()
-
-    label = args.label or os.path.splitext(os.path.basename(args.pred_csv))[0]
-
-    print("=" * 50)
-    print(f"BATHYMETRY VALIDATION -- {label}")
-    print("=" * 70)
-    print(f"Predictions: {args.pred_csv}")
-    print(f"WSM:         {args.wsm_path}")
-    print(f"Max dist:    {args.max_dist} m")
-    print(f"Output:      {args.output_dir}")
-    print()
-
     for flag, path in (
         ("--pred_csv", args.pred_csv),
         ("--ref_csv", args.ref_csv),
@@ -797,123 +709,63 @@ def main():
         if not os.path.isfile(path):
             print(f"ERROR: {flag} not found: {path}")
             sys.exit(1)
+    label = args.label or os.path.splitext(os.path.basename(args.pred_csv))[0]
+    output_dir = args.output_dir
+    print(f"Validation of {label} -> {output_dir}")
 
-    print("---Load predicted bathymetry ---")
     grid = load_predicted_grid(args.pred_csv)
-    print()
-
-    print("---Load ground truth ---")
-    ref_points = load_gt_reference_targets(args.ref_csv)
-    trans_points = load_gt_transect_points(args.transect_csv)
-    all_gt = ref_points + trans_points
-    print(f"Total GT points: {len(all_gt)}")
-
-    print("\nComputing GT depths from WSM...")
-    all_gt = compute_gt_depths(all_gt, args.wsm_path)
-
-    gt_depths_valid = [
-        p["gt_depth_m"] for p in all_gt if np.isfinite(p.get("gt_depth_m", np.nan))
-    ]
-    if gt_depths_valid:
-        gt_arr = np.array(gt_depths_valid)
-        print(f"\nGT depth summary ({len(gt_arr)} points):")
-        print(f"  Mean:   {np.mean(gt_arr):.3f} m")
-        print(f"  Median: {np.median(gt_arr):.3f} m")
-        print(f"  Std:    {np.std(gt_arr):.3f} m")
-        print(f"  Range:  [{np.min(gt_arr):.3f}, {np.max(gt_arr):.3f}] m")
-
-    print("\nReference target depths:")
-    for p in ref_points:
-        ws = p.get("ws_elevation", np.nan)
-        d = p.get("gt_depth_m", np.nan)
-        print(
-            f"  {p['name']:12s}  bed={p['elevation']:.3f}  ws={ws:.3f}  depth={d:.3f} m"
-        )
-    print()
-
-    print("---Match GT to predictions ---")
-    matches = match_gt_to_grid(all_gt, grid, max_dist_m=args.max_dist)
-    print()
-
-    print("---Compute error statistics ---")
-
-    ref_matches = [m for m in matches if m["type"] == "reference_target"]
-    trans_matches = [m for m in matches if m["type"] == "transect"]
-
+    gt_points = load_gt_points(args.ref_csv, args.transect_csv)
+    add_gt_depths(gt_points, args.wsm_path)
+    matches = match_gt_to_grid(gt_points, grid, args.max_dist)
     stats_all = compute_error_statistics(matches)
-    stats_ref = compute_error_statistics(ref_matches)
-    stats_trans = compute_error_statistics(trans_matches)
+    stats_ref = compute_error_statistics(
+        [m for m in matches if m["type"] == "reference_target"]
+    )
+    stats_transect = compute_error_statistics(
+        [m for m in matches if m["type"] == "transect"]
+    )
+    n_total = len(matches)
+    n_matched = sum(m["matched"] for m in matches)
 
-    n_matched = sum(1 for m in matches if m["matched"])
-
-    summary_lines = format_summary(
+    os.makedirs(output_dir, exist_ok=True)
+    save_comparison_csv(os.path.join(output_dir, "comparison.csv"), matches)
+    write_summary(
+        os.path.join(output_dir, "summary.txt"),
         label,
         stats_all,
         stats_ref,
-        stats_trans,
-        len(matches),
+        stats_transect,
+        n_total,
         n_matched,
     )
-    for line in summary_lines:
-        print(line)
-
-    print("---Save outputs ---")
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    save_comparison_csv(os.path.join(args.output_dir, "comparison.csv"), matches)
-
-    summary_path = os.path.join(args.output_dir, "summary.txt")
-    with open(summary_path, "w") as f:
-        f.write("\n".join(summary_lines) + "\n")
-    print(f"  Saved summary: {summary_path}")
-
-    stats_json = {
-        "model_label": label,
-        "pred_csv": os.path.abspath(args.pred_csv),
-        "n_gt_total": len(matches),
-        "n_matched": n_matched,
-        "n_unmatched": len(matches) - n_matched,
-        "max_match_dist_m": args.max_dist,
-        "stats_all": stats_all,
-        "stats_reference_targets": stats_ref,
-        "stats_transect_points": stats_trans,
-    }
-    stats_path = os.path.join(args.output_dir, "stats.json")
+    stats_path = os.path.join(output_dir, "stats.json")
     with open(stats_path, "w") as f:
-        json.dump(stats_json, f, indent=2)
-    print(f"  Saved stats JSON: {stats_path}")
+        json.dump(
+            {
+                "model_label": label,
+                "pred_csv": os.path.abspath(args.pred_csv),
+                "n_gt_total": n_total,
+                "n_matched": n_matched,
+                "n_unmatched": n_total - n_matched,
+                "max_match_dist_m": args.max_dist,
+                "stats_all": stats_all,
+                "stats_reference_targets": stats_ref,
+                "stats_transect_points": stats_transect,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Saved: {stats_path}")
 
-    print("\n--- Step 6: Generate plots ---")
-
-    plot_scatter(
-        matches,
-        stats_all,
-        label,
-        os.path.join(args.output_dir, "scatter.png"),
-    )
-    plot_transect_profiles(
-        matches,
-        label,
-        os.path.join(args.output_dir, "transects.png"),
-    )
+    plot_scatter(matches, stats_all, label, os.path.join(output_dir, "scatter.png"))
+    plot_transect_profiles(matches, label, os.path.join(output_dir, "transects.png"))
     plot_spatial_error_map(
-        matches,
-        grid,
-        label,
-        os.path.join(args.output_dir, "spatial_error.png"),
+        matches, grid, label, os.path.join(output_dir, "spatial_error.png")
     )
     plot_error_histogram(
-        matches,
-        stats_all,
-        label,
-        os.path.join(args.output_dir, "error_histogram.png"),
+        matches, stats_all, label, os.path.join(output_dir, "error_histogram.png")
     )
-
-    print()
-    print("=" * 70)
-    print("VALIDATION COMPLETE")
-    print("=" * 70)
-    print(f"All outputs saved to: {args.output_dir}/")
+    print(f"Done, outputs in {output_dir}")
 
 
 if __name__ == "__main__":

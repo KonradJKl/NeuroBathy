@@ -251,9 +251,9 @@ python 03_validate.py \
     --output_dir validation/pielach
 ```
 
-`03_validate.py` writes the matched points to `validation/pielach/comparison.csv`.
-Scripts 10 and 11 take it as input. Script 14 also needs the point cloud from 07 and the
-control points.
+`03_validate.py` writes every GT point with its nearest grid cell (column `matched`) to
+`validation/pielach/comparison.csv`. Scripts 10 and 11 take it as input. Script 14 also
+needs the point cloud from 07 and the control points.
 
 ## Limitations
 
