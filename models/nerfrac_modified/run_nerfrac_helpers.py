@@ -1,9 +1,17 @@
+"""
+The NeRFrac model: NeRFrac's refractive surface field and Snell's law (Zhan et al.,
+ICCV 2023) around the NeRF MLP, with the positional encoding and ray helpers of
+nerf-pytorch.
+
+NeuroBathy addition: land rays (water_mask <= 0.5) skip the refraction and are sampled
+straight from the near plane (sampling_direct, _forward_land); forward routes each ray
+by its mask.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Misc
 img2mse = lambda x, y: torch.mean((x - y) ** 2)
@@ -18,7 +26,7 @@ class Embedder:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.create_embedding_fn()
-        
+
     def create_embedding_fn(self):
         embed_fns = []
         d = self.kwargs["input_dims"]
@@ -41,10 +49,10 @@ class Embedder:
             for p_fn in self.kwargs["periodic_fns"]:
                 embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
                 out_dim += d
-                    
+
         self.embed_fns = embed_fns
         self.out_dim = out_dim
-        
+
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
@@ -52,7 +60,7 @@ class Embedder:
 def get_embedder(multires, i=0):
     if i == -1:
         return nn.Identity(), 3
-    
+
     embed_kwargs = {
         "include_input": True,
         "input_dims": 3,
@@ -61,7 +69,7 @@ def get_embedder(multires, i=0):
         "log_sampling": True,
         "periodic_fns": [torch.sin, torch.cos],
     }
-    
+
     embedder_obj = Embedder(**embed_kwargs)
     embed = lambda x, eo=embedder_obj: eo.embed(x)
     return embed, embedder_obj.out_dim
@@ -86,20 +94,10 @@ def get_embeddero(multires, i=0):
 
 
 class LeastSquares:
-    def __init__(self):
-        pass
-
-    def lstq(self, A, Y, lamb=0.0):
-        """
-        Differentiable least square
-        :param A: m x n
-        :param Y: m x 1
-        """
-        # Assuming A to be full column rank
-        
-        # QR decomposition
+    def lstq(self, A, Y):
+        """Batched least-squares solution w of A @ w = Y by QR, for A [B, m, n] with
+        full column rank and Y [B, m, 1]."""
         q, r = torch.linalg.qr(A, mode="reduced")
-        # w = torch.inverse(r) @ q.transpose(1, 2) @ Y
         w = torch.linalg.solve_triangular(r, q.transpose(1, 2) @ Y, upper=True)
 
         return w
@@ -110,12 +108,8 @@ class NeRF:
     def get_by_name(type, *args, **kwargs):
         print("NeRF type selected: %s" % type)
 
-        if type == "original":
-            model = NeRFOriginal(*args, **kwargs)
-
-        elif type == "nerfrac":
+        if type == "nerfrac":
             model = NeRFrac(*args, **kwargs)
-
         else:
             raise ValueError("Type %s not recognized." % type)
         return model
@@ -138,25 +132,22 @@ class NeRFrac(nn.Module):
         super(NeRFrac, self).__init__()
         self.D = D
         self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
         self.skips = skips
-        self.use_viewdirs = use_viewdirs
         self.embed_fn = embed_fn
         self.embeddirs_fn = embeddirs_fn
-        
+
         self.yita = modelargs.yita
         self.register_buffer("Himg", torch.tensor(float(modelargs.H)))
         self.register_buffer("Wimg", torch.tensor(float(modelargs.W)))
         self.register_buffer("f", torch.tensor(float(modelargs.f)))
         self.initdepth = modelargs.initdepth
-        
+
         self.i_embed = modelargs.i_embed
         self.omultires = modelargs.omultires
         self.refracvmultires = modelargs.refracvmultires
         self.N_samples = modelargs.N_samples
         self.N_importance = modelargs.N_importance
-        
+
         # refractive field P.E.
         self.embedo_fn, self.o_ch = get_embeddero(self.omultires, self.i_embed)
         self.embedrefracv_fn, self.refracv_ch = get_embedder(
@@ -171,7 +162,6 @@ class NeRFrac(nn.Module):
             skips=skips,
             input_ch_views=input_ch_views,
             use_viewdirs=use_viewdirs,
-            embed_fn=embed_fn,
         )
         self._occfine = NeRFOriginal(
             D=D,
@@ -181,11 +171,9 @@ class NeRFrac(nn.Module):
             skips=skips,
             input_ch_views=input_ch_views,
             use_viewdirs=use_viewdirs,
-            embed_fn=embed_fn,
         )
 
         self._refrac, self._refrac_out = self.create_refrac_net()
-        # nn.init.xavier_uniform_(self._refrac_out.weight, gain=1)
         # flat initialization
         nn.init.uniform_(self._refrac_out.weight, a=-1e-5, b=1e-5)
 
@@ -209,46 +197,6 @@ class NeRFrac(nn.Module):
                 h = torch.cat([new_origin, h], -1)
 
         return net_final(h)
-
-    def sampling_direct(self, origins, view_dirs):
-        """Standard NeRF-style sampling along the original ray (no refraction).
-
-        Samples from near=0 to far=1 along `view_dirs` starting from `origins`.
-        Mirrors the coarse sampling logic of `sampling()` but without the
-        surface-point offset that the refractive path uses.
-
-        :param origins: (N_rays, 3) ray origins in NDC
-        :param view_dirs: (N_rays, 3) view directions in NDC (already normalized or not)
-        :return: pts_flat, input_dirs_flat, z_vals, sample_ray  (same contract as sampling)
-        """
-        N_rays = origins.shape[0]
-        dev = origins.device
-
-        near = torch.zeros([N_rays, 1], dtype=torch.float, device=dev)
-        far = torch.ones([N_rays, 1], dtype=torch.float, device=dev)
-        t_vals = torch.linspace(0.0, 1.0, steps=self.N_samples, device=dev)
-        z_vals = near * (1.0 - t_vals) + far * t_vals
-        z_vals = z_vals.expand([N_rays, self.N_samples])
-
-        # Sampling
-        mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        upper = torch.cat([mids, z_vals[..., -1:]], -1)
-        lower = torch.cat([z_vals[..., :1], mids], -1)
-        t_rand = torch.rand(z_vals.shape, device=dev)
-        z_vals = lower + (upper - lower) * t_rand
-
-        # Scale view_dirs so the full range [0,1] reaches the far plane
-        sample_ray = view_dirs * (far - origins[..., -1:]) / view_dirs[..., -1:]
-
-        pts = (
-            origins[..., None, :] + sample_ray[..., None, :] * z_vals[..., :, None]
-        )  # [N_rays, N_samples, 3]
-        pts_flat = torch.reshape(pts, [-1, pts.shape[-1]])
-
-        input_dirs = sample_ray[:, None].expand([N_rays, self.N_samples, 3])
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-
-        return pts_flat, input_dirs_flat, z_vals, sample_ray
 
     def sampling(self, Xs, new_view):
         N_rays = Xs.shape[0]
@@ -281,11 +229,39 @@ class NeRFrac(nn.Module):
 
         return pts_flat, input_dirs_flat, z_vals, new_view
 
+    def sampling_direct(self, origins, view_dirs):
+        """Stratified samples along the unrefracted ray, from the near plane to z = 1
+        in NDC. Returns what sampling() returns, except that the view directions are
+        the scaled ray, not unit vectors."""
+        N_rays = origins.shape[0]
+        device = origins.device
+
+        near = torch.zeros([N_rays, 1], dtype=torch.float, device=device)
+        far = torch.ones([N_rays, 1], dtype=torch.float, device=device)
+        t_vals = torch.linspace(0.0, 1.0, steps=self.N_samples, device=device)
+        z_vals = near * (1.0 - t_vals) + far * t_vals
+        z_vals = z_vals.expand([N_rays, self.N_samples])
+
+        mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([mids, z_vals[..., -1:]], -1)
+        lower = torch.cat([z_vals[..., :1], mids], -1)
+        t_rand = torch.rand(z_vals.shape, device=device)
+        z_vals = lower + (upper - lower) * t_rand
+
+        # scaled so that z_vals from 0 to 1 run from the origin to the far plane
+        sample_ray = view_dirs * (far - origins[..., -1:]) / view_dirs[..., -1:]
+
+        pts = origins[..., None, :] + sample_ray[..., None, :] * z_vals[..., :, None]
+        pts_flat = torch.reshape(pts, [-1, pts.shape[-1]])
+
+        input_dirs = sample_ray[:, None].expand([N_rays, self.N_samples, 3])
+        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+
+        return pts_flat, input_dirs_flat, z_vals, sample_ray
+
     def get_norm(self, Xs_near):
         # given n points in real world, calculate local normal using LeastSquares
-        N = Xs_near.size()[0]
-        n = Xs_near.size()[1]
-        
+
         # centering
         Xs_center = torch.mean(Xs_near, dim=1).unsqueeze(dim=1)
         Xs_near = Xs_near - Xs_center
@@ -293,21 +269,19 @@ class NeRFrac(nn.Module):
         pts_xy, pts_z = torch.split(Xs_near, [2, 1], dim=-1)
 
         ls = LeastSquares()
-        w = ls.lstq(pts_xy, pts_z, 0.010)
+        w = ls.lstq(pts_xy, pts_z)
         w = w.squeeze(-1)
         w1, w2 = torch.split(w, [1, 1], dim=-1)
         norm_near = torch.cat([-w1, -w2, torch.ones_like(w1)], dim=-1)
         norm_near = norm_near / torch.norm(norm_near, dim=-1, keepdim=True)
 
-        if norm_near[0, 2] < 0:
-            print("===")
-
         return norm_near
 
     def smooth(self, dD_near):
         N = dD_near.size()[0]
-        n = dD_near.size()[1]
 
+        # dD of the 3x3 neighborhood in run_nerfrac.py's NEIGHBOR_OFFSETS order: 0 is
+        # the center, 2 and 7 lie above and below it, 4 and 5 left and right
         dx = torch.abs((dD_near[:, 5] - dD_near[:, 4]) / 2)
         dy = torch.abs((dD_near[:, 7] - dD_near[:, 2]) / 2)
 
@@ -361,27 +335,27 @@ class NeRFrac(nn.Module):
         return d_ndc
 
     def ndcp2camp(self, points, W=None, H=None, f=None):
-
         z = 2 / (points[:, 2] - 1)
         y = -(H * points[:, 1] * z) / (2 * f)
         x = -(W * points[:, 0] * z) / (2 * f)
         z = z.unsqueeze(1)
         y = y.unsqueeze(1)
         x = x.unsqueeze(1)
-        
+
         points_camera = torch.cat([x, y, z], dim=-1)
 
         return points_camera
 
     def getweight(self, raw, z_vals, rays_d):
-        raw2alpha = lambda raw, dists, act_fn=F.relu: 1.0 - torch.exp(-act_fn(raw) * dists)
+        raw2alpha = lambda raw, dists, act_fn=F.relu: 1.0 - torch.exp(
+            -act_fn(raw) * dists
+        )
 
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         infinity = torch.tensor([1e10], device=z_vals.device).expand(
             dists[..., :1].shape
         )
         dists = torch.cat([dists, infinity], -1)
-        # dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples]
 
         dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
@@ -426,11 +400,9 @@ class NeRFrac(nn.Module):
         return pts_flat, input_dirs_flat, z_vals
 
     def _forward_water(self, x_water):
-        """Full refractive pipeline for water rays.
-
-        :param x_water: (N_w, 9, 6) input tensor for water rays
-        :return: out_fine, Xs_ndc, z_vals_fine, sample_ray, dD
-        """
+        """The refractive path. The 9 rays of each bundle hit the learned surface, a
+        plane fitted to the 9 hits gives the normal, and the center ray is refracted
+        at its hit and sampled below the surface."""
         N_w = x_water.shape[0]
         input_views_ndc, input_o_ndc = torch.split(x_water, [3, 3], dim=-1)
 
@@ -438,11 +410,11 @@ class NeRFrac(nn.Module):
             input_views_ndc, [-1, input_views_ndc.shape[-1]]
         )
         input_o_ndc = torch.reshape(input_o_ndc, [-1, input_o_ndc.shape[-1]])
-        
+
         ox, oy, oz = torch.split(input_o_ndc, [1, 1, 1], dim=-1)
         virx, viry, virz = torch.split(input_views_ndc, [1, 1, 1], dim=-1)
-        
-        # all points are on near plane so oz become identical and are not use
+
+        # the origins lie on the near plane (constant oz), so only (ox, oy) is encoded
         input_o = torch.cat([ox, oy], dim=-1)
         refrac_input_o = self.embedo_fn(input_o)
         refrac_input_views = self.embedrefracv_fn(input_views_ndc)
@@ -458,7 +430,7 @@ class NeRFrac(nn.Module):
         # back to real world for normal calculation
         Xs_real = self.ndcp2camp(Xs_ndc, self.Wimg, self.Himg, self.f)
         Xs_real = Xs_real.view([-1, 9, 3])
-        
+
         # normal calculation
         norm_real = self.get_norm(Xs_real)
 
@@ -471,7 +443,8 @@ class NeRFrac(nn.Module):
             input_views_ndc, Xs_ndc, self.Wimg, self.Himg, self.f
         )
 
-        # vector follow: rightdown(input views), up(normals), rightdown(refracted views)
+        # vector form of Snell's law; the normal points back towards the camera, so
+        # c1 = cos(theta_i) > 0
         c1 = -torch.sum(norm_real * input_view_real, dim=-1)
         mid = torch.ones_like(c1) - (1 / self.yita) * (1 / self.yita) * (
             torch.ones_like(c1) - c1 * c1
@@ -494,7 +467,7 @@ class NeRFrac(nn.Module):
 
         input_pts = self.embed_fn(input_pts)
         view_flat = self.embeddirs_fn(view_flat)
-        out = self._occ(torch.cat([input_pts, view_flat], dim=-1), None)
+        out = self._occ(torch.cat([input_pts, view_flat], dim=-1))
         out = torch.reshape(out, [N_w] + [self.N_samples] + [out.shape[-1]])
 
         # fine sampling
@@ -504,38 +477,30 @@ class NeRFrac(nn.Module):
         )
         input_pts_fine = self.embed_fn(input_pts_fine)
         view_flat_fine = self.embeddirs_fn(view_flat_fine)
-        out_fine = self._occfine(
-            torch.cat([input_pts_fine, view_flat_fine], dim=-1), None
-        )
+        out_fine = self._occfine(torch.cat([input_pts_fine, view_flat_fine], dim=-1))
 
         return out_fine, Xs_ndc, z_vals_fine, sample_ray, dD
 
-    def _forward_nonwater(self, x_nw):
-        """Standard NeRF pipeline for non-water rays (no refraction).
+    def _forward_land(self, x_land):
+        """The land path. The center ray of each bundle is sampled straight from the
+        near plane, without refraction."""
+        N_land = x_land.shape[0]
+        input_views_ndc, input_o_ndc = torch.split(x_land, [3, 3], dim=-1)
 
-        :param x_nw: (N_nw, 9, 6) input tensor for non-water rays
-        :return: out_fine, Xs_ndc, z_vals_fine, sample_ray, dD
-        """
-        N_nw = x_nw.shape[0]
-        input_views_ndc, input_o_ndc = torch.split(x_nw, [3, 3], dim=-1)
+        views_center = input_views_ndc[:, 0, :]  # [N_land, 3]
+        origins_center = input_o_ndc[:, 0, :]  # [N_land, 3]
 
-        # Only use the center ray (index 0), ignore neighbors
-        views_center = input_views_ndc[:, 0, :]  # (N_nw, 3)
-        origins_center = input_o_ndc[:, 0, :]  # (N_nw, 3)
+        # no surface displacement, one value per neighbor as in the water path
+        dD = torch.zeros(N_land * 9, 1, device=x_land.device)
 
-        # dD = 0 for non-water rays (no refractive displacement)
-        # Shape: (N_nw*9, 1) to match the water path's dD which is per-neighbor
-        dD = torch.zeros(N_nw * 9, 1, device=x_nw.device)
-
-        # Sample from origin along original view direction (no refraction)
         input_pts, view_flat, z_vals, sample_ray = self.sampling_direct(
             origins_center, views_center
         )
 
         input_pts = self.embed_fn(input_pts)
         view_flat = self.embeddirs_fn(view_flat)
-        out = self._occ(torch.cat([input_pts, view_flat], dim=-1), None)
-        out = torch.reshape(out, [N_nw] + [self.N_samples] + [out.shape[-1]])
+        out = self._occ(torch.cat([input_pts, view_flat], dim=-1))
+        out = torch.reshape(out, [N_land] + [self.N_samples] + [out.shape[-1]])
 
         # fine sampling
         weights = self.getweight(out, z_vals, sample_ray)
@@ -544,87 +509,59 @@ class NeRFrac(nn.Module):
         )
         input_pts_fine = self.embed_fn(input_pts_fine)
         view_flat_fine = self.embeddirs_fn(view_flat_fine)
-        out_fine = self._occfine(
-            torch.cat([input_pts_fine, view_flat_fine], dim=-1), None
-        )
+        out_fine = self._occfine(torch.cat([input_pts_fine, view_flat_fine], dim=-1))
 
-        # Xs_ndc for non-water is just the origin (no surface point)
+        # a land ray has no surface point, so its Xs is the origin on the near plane
         Xs_ndc = origins_center
 
         return out_fine, Xs_ndc, z_vals_fine, sample_ray, dD
 
     def forward(self, x, water_mask):
-        """Forward pass with per-ray water mask for hybrid rendering.
+        """Water rays (water_mask > 0.5) take the refractive path, the others the land
+        path.
 
-        :param x: (N_ray, 9, 6) input rays with neighbors
-        :param water_mask: (N_ray,) float tensor — 1.0 = water, 0.0 = non-water.
-                           If None, falls back to all-water (legacy behavior).
+        x is [N_ray, 9, 6]: the NDC view direction and origin of each ray and its 3x3
+        neighbors. Returns, in ray order, the fine network output [N_ray * S, C], Xs
+        [N_ray, 3] (the origin for land rays), z_vals [N_ray, S], the scaled sample
+        rays [N_ray, 3] and dD [N_ray * 9, 1] (0 for land rays), with
+        S = N_samples + N_importance.
         """
         N_ray = x.shape[0]
-
-        # Backup fallback: if no mask provided, treat all as water
-        if water_mask is None:
-            water_mask = torch.ones(N_ray, device=x.device)
-
         water_bool = water_mask > 0.5
         N_water = water_bool.sum().item()
-        N_nonwater = N_ray - N_water
 
-        if N_nonwater == 0:
+        if N_water == N_ray:
             return self._forward_water(x)
-
         if N_water == 0:
-            return self._forward_nonwater(x)
+            return self._forward_land(x)
 
         water_idx = torch.where(water_bool)[0]
-        nonwater_idx = torch.where(~water_bool)[0]
+        land_idx = torch.where(~water_bool)[0]
+        water_out = self._forward_water(x[water_idx])
+        land_out = self._forward_land(x[land_idx])
 
-        x_w = x[water_idx]  # (N_water, 9, 6)
-        x_nw = x[nonwater_idx]  # (N_nonwater, 9, 6)
+        # both results back into ray order
+        S = self.N_samples + self.N_importance
+        out_ch = water_out[0].shape[-1]
+        merged = [
+            torch.empty(N_ray, S, out_ch, device=x.device),
+            torch.empty(N_ray, 3, device=x.device),
+            torch.empty(N_ray, S, device=x.device),
+            torch.empty(N_ray, 3, device=x.device),
+            torch.empty(N_ray, 9, 1, device=x.device),
+        ]
+        for out, water, land in zip(merged, water_out, land_out):
+            out[water_idx] = water.view(-1, *out.shape[1:])
+            out[land_idx] = land.view(-1, *out.shape[1:])
+        out_fine, Xs_ndc, z_vals_fine, sample_ray, dD = merged
 
-        out_fine_w, Xs_ndc_w, z_vals_fine_w, sample_ray_w, dD_w = self._forward_water(
-            x_w
+        return (
+            out_fine.view(-1, out_ch),
+            Xs_ndc,
+            z_vals_fine,
+            sample_ray,
+            dD.view(-1, 1),
         )
-        out_fine_nw, Xs_ndc_nw, z_vals_fine_nw, sample_ray_nw, dD_nw = (
-            self._forward_nonwater(x_nw)
-        )
-
-        N_total_samples = self.N_samples + self.N_importance
-        out_ch = out_fine_w.shape[-1]
-
-        # out_fine (N_ray * N_total_samples, out_ch)
-        out_fine = torch.empty(N_ray * N_total_samples, out_ch, device=x.device)
-        Xs_ndc = torch.empty(N_ray, 3, device=x.device)
-        z_vals_fine = torch.empty(N_ray, N_total_samples, device=x.device)
-        sample_ray = torch.empty(N_ray, 3, device=x.device)
-        dD = torch.empty(N_ray * 9, 1, device=x.device)
-
-        # Flat indices for out_fine: each ray i owns rows [i*S .. (i+1)*S-1]
-        S = N_total_samples
-        arange_S = torch.arange(S, device=x.device)
-
-        w_out_idx = (water_idx[:, None] * S + arange_S[None, :]).reshape(-1)
-        out_fine[w_out_idx] = out_fine_w
-        Xs_ndc[water_idx] = Xs_ndc_w
-        z_vals_fine[water_idx] = z_vals_fine_w
-        sample_ray[water_idx] = sample_ray_w
-
-        nw_out_idx = (nonwater_idx[:, None] * S + arange_S[None, :]).reshape(-1)
-        out_fine[nw_out_idx] = out_fine_nw
-        Xs_ndc[nonwater_idx] = Xs_ndc_nw
-        z_vals_fine[nonwater_idx] = z_vals_fine_nw
-        sample_ray[nonwater_idx] = sample_ray_nw
-
-        w_flat_idx = (
-            water_idx[:, None] * 9 + torch.arange(9, device=x.device)[None, :]
-        ).reshape(-1)
-        nw_flat_idx = (
-            nonwater_idx[:, None] * 9 + torch.arange(9, device=x.device)[None, :]
-        ).reshape(-1)
-        dD[w_flat_idx] = dD_w
-        dD[nw_flat_idx] = dD_nw
-
-        return out_fine, Xs_ndc, z_vals_fine, sample_ray, dD
 
 
 class NeRFOriginal(nn.Module):
@@ -637,20 +574,12 @@ class NeRFOriginal(nn.Module):
         skips=[4],
         input_ch_views=3,
         use_viewdirs=False,
-        embed_fn=None,
-        embeddirs_fn=None,
     ):
-        """ """
         super(NeRFOriginal, self).__init__()
-        self.D = D
-        self.W = W
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
         self.skips = skips
         self.use_viewdirs = use_viewdirs
-
-        # self.pts_linears = nn.ModuleList(
-        #    [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
 
         layers = [nn.Linear(input_ch, W)]
         for i in range(D - 1):
@@ -666,10 +595,6 @@ class NeRFOriginal(nn.Module):
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W // 2)])
 
-        ### Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
             self.alpha_linear = nn.Linear(W, 1)
@@ -677,7 +602,7 @@ class NeRFOriginal(nn.Module):
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
-    def forward(self, x, water_mask=None):
+    def forward(self, x):
         input_pts, input_views = torch.split(
             x, [self.input_ch, self.input_ch_views], dim=-1
         )
@@ -703,55 +628,6 @@ class NeRFOriginal(nn.Module):
             outputs = self.output_linear(h)
 
         return outputs
-
-    def load_weights_from_keras(self, weights):
-        assert self.use_viewdirs, "Not implemented if use_viewdirs=False"
-        
-        # Load pts_linears
-        for i in range(self.D):
-            idx_pts_linears = 2 * i
-            self.pts_linears[i].weight.data = torch.from_numpy(
-                np.transpose(weights[idx_pts_linears])
-            )
-            self.pts_linears[i].bias.data = torch.from_numpy(
-                np.transpose(weights[idx_pts_linears + 1])
-            )
-
-        # Load feature_linear
-        idx_feature_linear = 2 * self.D
-        self.feature_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_feature_linear])
-        )
-        self.feature_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_feature_linear + 1])
-        )
-
-        # Load views_linears
-        idx_views_linears = 2 * self.D + 2
-        self.views_linears[0].weight.data = torch.from_numpy(
-            np.transpose(weights[idx_views_linears])
-        )
-        self.views_linears[0].bias.data = torch.from_numpy(
-            np.transpose(weights[idx_views_linears + 1])
-        )
-
-        # Load rgb_linear
-        idx_rbg_linear = 2 * self.D + 4
-        self.rgb_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_rbg_linear])
-        )
-        self.rgb_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_rbg_linear + 1])
-        )
-
-        # Load alpha_linear
-        idx_alpha_linear = 2 * self.D + 6
-        self.alpha_linear.weight.data = torch.from_numpy(
-            np.transpose(weights[idx_alpha_linear])
-        )
-        self.alpha_linear.bias.data = torch.from_numpy(
-            np.transpose(weights[idx_alpha_linear + 1])
-        )
 
 
 # Ray helpers
@@ -822,7 +698,7 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 # Hierarchical sampling (section 5.2)
-def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
+def sample_pdf(bins, weights, N_samples, det=False):
     # Get pdf
     weights = weights + 1e-5  # prevent nans
     pdf = weights / torch.sum(weights, -1, keepdim=True)
@@ -837,17 +713,6 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     else:
         u = torch.rand(list(cdf.shape[:-1]) + [N_samples], device=device)
 
-    # Pytest, overwrite u with numpy's fixed random numbers
-    if pytest:
-        np.random.seed(0)
-        new_shape = list(cdf.shape[:-1]) + [N_samples]
-        if det:
-            u = np.linspace(0.0, 1.0, N_samples)
-            u = np.broadcast_to(u, new_shape)
-        else:
-            u = np.random.rand(*new_shape)
-        u = torch.Tensor(u).to(device)
-
     # Invert CDF
     u = u.contiguous()
     inds = torch.searchsorted(cdf, u, right=True)
@@ -855,8 +720,6 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
 
-    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)

@@ -19,8 +19,8 @@ Changes made for shallow-water bathymetry from drone imagery:
   applied to water rays (`--smooth_weight`, default 0.01, with warmup).
 - Training safeguards: gradient clipping (`--grad_clip`, default 1.0), batches
   with a NaN or Inf loss are skipped, the refractive offset is clamped to
-  [-1, 1] and the Snell's-law radicand is clamped (no NaN under total internal
-  reflection).
+  [-1, 1] and the Snell's-law radicand is clamped (only an index below 1 could
+  make it negative; from air into water it never is).
 - Expected depth, mode depth (sample with the highest weight) and accumulated
   opacity are saved for every rendered view; upstream saved only the RGB image
   and the surface points.
