@@ -99,7 +99,12 @@ def extract_gps_from_colmap_db(db_path):
         "NULL AND prior_ty IS NOT NULL AND prior_tz IS NOT NULL"
     ).fetchall()
     conn.close()
-    return {name: np.array([lat, lon, alt]) for name, lat, lon, alt in rows}
+    # (0, 0) is the placeholder of a camera without a fix, as in read_exif_gps
+    return {
+        name: np.array([lat, lon, alt])
+        for name, lat, lon, alt in rows
+        if not (lat == 0 and lon == 0)
+    }
 
 
 def wgs84_dict_to_projected(gps_dict, epsg):
@@ -296,7 +301,7 @@ def save_umeyama(path, s, R, t, **metadata):
 
 
 def load_umeyama(path):
-    data = np.load(path, allow_pickle=True)
+    data = np.load(path)
     result = {}
     for key in data.files:
         val = data[key]
@@ -351,8 +356,9 @@ def write_ply_binary(filepath, points, colors=None, scalar_fields=None):
         scalar_fields = {}
 
 
-    props = "property float x\nproperty float y\nproperty float z\n"
-    dtype_fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+    # float64 easting and northing: float32 rounds a UTM northing to 0.5 m
+    props = "property double x\nproperty double y\nproperty float z\n"
+    dtype_fields = [("x", "<f8"), ("y", "<f8"), ("z", "<f4")]
 
     if colors is not None:
         props += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
@@ -367,8 +373,8 @@ def write_ply_binary(filepath, points, colors=None, scalar_fields=None):
 
     vertex_dtype = np.dtype(dtype_fields)
     vertices = np.empty(N, dtype=vertex_dtype)
-    vertices["x"] = points[:, 0].astype(np.float32)
-    vertices["y"] = points[:, 1].astype(np.float32)
+    vertices["x"] = points[:, 0]
+    vertices["y"] = points[:, 1]
     vertices["z"] = points[:, 2].astype(np.float32)
 
     if colors is not None:
@@ -393,32 +399,18 @@ def discover_nerfrac_views(testset_dir, depth_type="mean"):
     views = []
     idx = 0
     while True:
-        # surface points — try both naming conventions
-        xs_path = None
-        for pattern in [f"Xs_pts{idx:03d}.npy", f"Xs_pts_{idx:03d}.npy"]:
-            p = os.path.join(testset_dir, pattern)
-            if os.path.exists(p):
-                xs_path = p
-                break
-
-        # refracted ray directions
+        # surface points and refracted ray directions, as run_nerfrac.py names them
+        xs_path = os.path.join(testset_dir, f"Xs_pts{idx:03d}.npy")
         rays_path = os.path.join(testset_dir, f"rays_{idx:03d}.npy")
-        if not os.path.exists(rays_path):
-            rays_path2 = os.path.join(testset_dir, f"rays{idx:03d}.npy")
-            if os.path.exists(rays_path2):
-                rays_path = rays_path2
-            elif xs_path is None:
-                break
-            else:
-                rays_path = None
+        xs_path = xs_path if os.path.exists(xs_path) else None
+        rays_path = rays_path if os.path.exists(rays_path) else None
+        if xs_path is None and rays_path is None:
+            break
 
-        depth_candidates = glob.glob(
-            os.path.join(testset_dir, f"*{idx:03d}{depth_suffix}")
+        depth_candidates = sorted(
+            glob.glob(os.path.join(glob.escape(testset_dir), f"*{idx:03d}{depth_suffix}"))
         )
         depth_path = depth_candidates[0] if depth_candidates else None
-
-        if xs_path is None and rays_path is None and depth_path is None:
-            break
 
         views.append({"xs": xs_path, "rays": rays_path,
                        "depth": depth_path, "index": idx})
@@ -428,11 +420,25 @@ def discover_nerfrac_views(testset_dir, depth_type="mean"):
 
 
 def discover_vggt_views(vggt_dir):
+    # views beyond the image names of metadata.json are left from an earlier, larger
+    # run into the same folder
+    names = load_vggt_image_names(vggt_dir)
     views = []
     idx = 0
     while True:
         wp_path = os.path.join(vggt_dir, f"world_points_{idx:03d}.npy")
         if not os.path.exists(wp_path):
+            break
+        if names is not None and idx >= len(names):
+            n_left_out = 0
+            while os.path.exists(
+                os.path.join(vggt_dir, f"world_points_{idx + n_left_out:03d}.npy")
+            ):
+                n_left_out += 1
+            print(
+                f"  {n_left_out} view(s) after the {len(names)} of metadata.json left "
+                "out (an earlier run into the same folder)"
+            )
             break
         conf_path = os.path.join(vggt_dir, f"depth_conf_{idx:03d}.npy")
         if not os.path.exists(conf_path):
