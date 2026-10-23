@@ -28,7 +28,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
+from collections import Counter
 
 import numpy as np
 
@@ -95,35 +97,33 @@ def parse_args():
         help="Output directory for validation results (default: validation/)",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.max_dist >= 0:
+        parser.error("--max_dist must be 0 or more")
+    return args
+
+
+PRED_COLUMNS = {
+    "easting": "utm_easting",
+    "northing": "utm_northing",
+    "elevation": "utm_elevation",
+    "depth_m": "depth_m",
+}
 
 
 def load_predicted_grid(csv_path):
-    """Load predicted bathymetry grid CSV from 02_extract_bathymetry.py.
-
-    Expected columns:
-      utm_easting, utm_northing, utm_elevation, depth_m,
-      depth_std, wsm_elevation, n_observations
-
-    :return: dict with arrays for each column
-    """
-    data = np.genfromtxt(csv_path, delimiter=",", skip_header=1)
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-
-    n_cols = data.shape[1]
-    result = {
-        "easting": data[:, 0],
-        "northing": data[:, 1],
-        "elevation": data[:, 2],
-        "depth_m": data[:, 3],
-    }
-    if n_cols > 4:
-        result["depth_std"] = data[:, 4]
-    if n_cols > 5:
-        result["wsm_elevation"] = data[:, 5]
-    if n_cols > 6:
-        result["n_observations"] = data[:, 6].astype(int)
+    """Load predicted bathymetry grid CSV from 02_extract_bathymetry.py."""
+    data = np.genfromtxt(
+        csv_path, delimiter=",", names=True, ndmin=1, encoding="utf-8-sig"
+    )
+    missing = [c for c in PRED_COLUMNS.values() if c not in (data.dtype.names or ())]
+    if missing:
+        print(f"ERROR: {csv_path} has no column {', '.join(missing)}")
+        sys.exit(1)
+    if len(data) == 0:
+        print(f"ERROR: {csv_path} has no grid cells")
+        sys.exit(1)
+    result = {key: data[col].copy() for key, col in PRED_COLUMNS.items()}
 
     print(f"Loaded predicted grid: {len(data):,} cells from {csv_path}")
     print(f"  Easting:  [{result['easting'].min():.2f}, {result['easting'].max():.2f}]")
@@ -150,10 +150,15 @@ def load_gt_reference_targets(csv_path):
     points = []
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f, delimiter=",")
-        header = next(reader)
+        header = next(reader, None)
         for row in reader:
-            if len(row) < 4:
+            if not any(field.strip() for field in row):
                 continue
+            if len(row) < 4:
+                print(
+                    f"ERROR: {csv_path} line {reader.line_num} has fewer than 4 columns"
+                )
+                sys.exit(1)
             name = row[0].strip()
             easting = float(row[1].strip())
             northing = float(row[2].strip())
@@ -176,10 +181,15 @@ def load_gt_transect_points(csv_path):
     points = []
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f, delimiter=",")
-        header = next(reader)
+        header = next(reader, None)
         for row in reader:
-            if len(row) < 4:
+            if not any(field.strip() for field in row):
                 continue
+            if len(row) < 4:
+                print(
+                    f"ERROR: {csv_path} line {reader.line_num} has fewer than 4 columns"
+                )
+                sys.exit(1)
             name = row[0].strip()
             easting = float(row[1].strip())
             northing = float(row[2].strip())
@@ -480,7 +490,7 @@ def plot_scatter(matches, stats, label, filepath):
         )
 
     all_vals = np.concatenate([gt, pred])
-    lim_min = max(0, all_vals.min() - 0.1)
+    lim_min = all_vals.min() - 0.1
     lim_max = all_vals.max() + 0.1
     ax.plot(
         [lim_min, lim_max],
@@ -525,20 +535,57 @@ def plot_scatter(matches, stats, label, filepath):
     print(f"  Saved scatter plot: {filepath}")
 
 
-def plot_transect_profiles(matches, label, filepath):
-    from collections import defaultdict
+def natural_key(name):
+    return [int(t) if t.isdecimal() else t for t in re.split(r"(\d+)", name)]
 
-    transect_data = defaultdict(list)
+
+def along_transect(points):
+    """The points of a transect run in their order along its main direction.
+
+    The survey order can jump back: QP15_7 lies between QP15_4 and QP15_5.
+    """
+    xy = np.array([[p["gt_easting"], p["gt_northing"]] for p in points])
+    xy -= xy.mean(axis=0)
+    position = xy @ np.linalg.svd(xy, full_matrices=False)[2][0]
+    if position[-1] < position[0]:
+        position = -position
+    return [points[i] for i in np.argsort(position, kind="stable")]
+
+
+def transect_panels(matches):
+    """(title, points) of each transect, in natural order of the names.
+
+    A transect name can label separate runs of rows (QP15 has two cross-sections),
+    and each run gets its own panel.
+    """
+    runs = []
     for m in matches:
         if m["type"] == "transect" and m.get("transect"):
-            transect_data[m["transect"]].append(m)
+            if runs and runs[-1][0] == m["transect"]:
+                runs[-1][1].append(m)
+            else:
+                runs.append((m["transect"], [m]))
+    first_run = {}
+    for i, (name, _) in enumerate(runs):
+        first_run.setdefault(name, i)
+    runs.sort(key=lambda run: (natural_key(run[0]), first_run[run[0]]))
+    n_runs = Counter(name for name, _ in runs)
+    seen = Counter()
+    panels = []
+    for name, points in runs:
+        seen[name] += 1
+        title = name if n_runs[name] == 1 else f"{name} ({seen[name]}/{n_runs[name]})"
+        panels.append((title, along_transect(points)))
+    return panels
 
-    if len(transect_data) == 0:
+
+def plot_transect_profiles(matches, label, filepath):
+    panels = transect_panels(matches)
+    if len(panels) == 0:
         print("  [WARN] No transect data for profiles")
         return
 
-    sorted_transects = sorted(transect_data.keys())
-    n_trans = len(sorted_transects)
+    n_trans = len(panels)
 
     ncols = min(4, n_trans)
     nrows = int(np.ceil(n_trans / ncols))
@@ -546,12 +593,11 @@ def plot_transect_profiles(matches, label, filepath):
         nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False
     )
 
-    for idx, tname in enumerate(sorted_transects):
+    for idx, (tname, pts) in enumerate(panels):
         row = idx // ncols
         col = idx % ncols
         ax = axes[row, col]
 
-        pts = transect_data[tname]
         eas = np.array([p["gt_easting"] for p in pts])
         nor = np.array([p["gt_northing"] for p in pts])
         seg_dist = np.sqrt(np.diff(eas) ** 2 + np.diff(nor) ** 2)
@@ -616,8 +662,8 @@ def plot_spatial_error_map(matches, grid, label, filepath):
         cmap="viridis",
         s=0.1,
         alpha=0.3,
-        vmin=np.percentile(grid["depth_m"], 1),
-        vmax=np.percentile(grid["depth_m"], 99),
+        vmin=np.nanpercentile(grid["depth_m"], 1),
+        vmax=np.nanpercentile(grid["depth_m"], 99),
     )
     cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
     cbar.set_label("Predicted Depth (m)", fontsize=11)
@@ -742,12 +788,17 @@ def main():
     print(f"Output:      {args.output_dir}")
     print()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    for flag, path in (
+        ("--pred_csv", args.pred_csv),
+        ("--ref_csv", args.ref_csv),
+        ("--transect_csv", args.transect_csv),
+        ("--wsm_path", args.wsm_path),
+    ):
+        if not os.path.isfile(path):
+            print(f"ERROR: {flag} not found: {path}")
+            sys.exit(1)
 
     print("---Load predicted bathymetry ---")
-    if not os.path.exists(args.pred_csv):
-        print(f"ERROR: Prediction CSV not found: {args.pred_csv}")
-        sys.exit(1)
     grid = load_predicted_grid(args.pred_csv)
     print()
 
@@ -807,6 +858,7 @@ def main():
         print(line)
 
     print("---Save outputs ---")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     save_comparison_csv(os.path.join(args.output_dir, "comparison.csv"), matches)
 
@@ -862,10 +914,6 @@ def main():
     print("VALIDATION COMPLETE")
     print("=" * 70)
     print(f"All outputs saved to: {args.output_dir}/")
-    for fname in sorted(os.listdir(args.output_dir)):
-        fpath = os.path.join(args.output_dir, fname)
-        size_kb = os.path.getsize(fpath) / 1024
-        print(f"  {fname} ({size_kb:.1f} KB)")
 
 
 if __name__ == "__main__":
