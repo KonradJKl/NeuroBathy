@@ -3,8 +3,8 @@
 
 Usage:
     python 11_scale_correction.py \\
-        --comparison_csv validation/nerfrac_50m_wsm/comparison.csv \\
-        --output_dir     validation/nerfrac_50m_wsm/
+        --comparison_csv validation/nerfrac_50m/comparison.csv \\
+        --bathymetry_csv bathymetry/bathymetry_nerfrac_50m.csv
 """
 
 import argparse
@@ -14,7 +14,16 @@ import sys
 import numpy as np
 import pandas as pd
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from coord_utils import compute_metrics
+
+
+def n_targets(n):
+    return f"{n} ref target" + ("" if n == 1 else "s")
 
 
 def print_metrics_table(rows):
@@ -67,13 +76,37 @@ def main():
         print(f"[ERROR] File not found: {args.comparison_csv}")
         sys.exit(1)
 
-    if args.output_dir is None:
-        args.output_dir = os.path.dirname(args.comparison_csv)
-    os.makedirs(args.output_dir, exist_ok=True)
+    bathy = None
+    if args.bathymetry_csv:
+        if not os.path.isfile(args.bathymetry_csv):
+            print(f"ERROR: Bathymetry CSV not found: {args.bathymetry_csv}")
+            sys.exit(1)
+        bathy = pd.read_csv(args.bathymetry_csv)
+        required_cols = {"utm_easting", "utm_northing", "utm_elevation", "depth_m"}
+        if not required_cols.issubset(set(bathy.columns)):
+            print(
+                f"ERROR: Bathymetry CSV missing columns: "
+                f"{required_cols - set(bathy.columns)}"
+            )
+            sys.exit(1)
+        if bathy.empty:
+            print(f"ERROR: Bathymetry CSV has no rows: {args.bathymetry_csv}")
+            sys.exit(1)
 
     df = pd.read_csv(args.comparison_csv)
-    df = df[df["matched"] == "yes"].copy()
+    df = df[df["matched"] == "yes"]
+    # 03 also marks GT points off the WSM as matched, without a GT depth
+    finite = np.isfinite(df["gt_depth_m"]) & np.isfinite(df["pred_depth_m"])
+    if not finite.all():
+        print(f"Dropped {(~finite).sum()} matched points without a GT or predicted depth")
+    df = df[finite].copy()
     print(f"Loaded {len(df)} matched points from {args.comparison_csv}")
+    if len(df) == 0:
+        print("ERROR: No matched points")
+        sys.exit(1)
+
+    args.output_dir = args.output_dir or os.path.dirname(args.comparison_csv) or "."
+    os.makedirs(args.output_dir, exist_ok=True)
 
     gt_depth = df["gt_depth_m"].values
     pred_depth = df["pred_depth_m"].values
@@ -95,12 +128,18 @@ def main():
     )
     results.extend([m_all, m_ref, m_trn])
 
-    # scale = median(gt / pred) for reference targets
+    # scale = median(gt / pred) over the reference targets with a predicted depth
     ref_gt = gt_depth[ref_mask]
     ref_pred = pred_depth[ref_mask]
-    scale_factor = np.median(ref_gt / ref_pred)
-    print(f"\nScale factor (median gt/pred on ref targets): {scale_factor:.4f}")
-    print(f"  => pred_depth is {1 / scale_factor:.2f}x too large on average")
+    scale_mask = ref_mask & (pred_depth > 0)
+    n_scale = int(scale_mask.sum())
+    if n_scale:
+        scale_factor = np.median(gt_depth[scale_mask] / pred_depth[scale_mask])
+        print(f"\nScale factor (median gt/pred on {n_targets(n_scale)}): {scale_factor:.4f}")
+        print(f"  => predicted / GT depth at the reference targets: {1 / scale_factor:.2f}")
+    else:
+        scale_factor = np.nan
+        print("\nScale factor skipped: no reference target with a predicted depth")
 
     scaled_pred = pred_depth * scale_factor
 
@@ -113,12 +152,16 @@ def main():
     )
     results.extend([m_s_all, m_s_ref, m_s_trn])
 
-    A = np.column_stack([ref_pred, np.ones_like(ref_pred)])
-    coefs, _, _, _ = np.linalg.lstsq(A, ref_gt, rcond=None)
-    a_coef, b_coef = coefs
-    print(
-        f"\nAffine fit on ref targets: depth_corrected = {a_coef:.4f} * pred + {b_coef:.4f}"
-    )
+    if ref_mask.sum() >= 3:
+        A = np.column_stack([ref_pred, np.ones_like(ref_pred)])
+        coefs, _, _, _ = np.linalg.lstsq(A, ref_gt, rcond=None)
+        a_coef, b_coef = coefs
+        print(
+            f"\nAffine fit on ref targets: depth_corrected = {a_coef:.4f} * pred + {b_coef:.4f}"
+        )
+    else:
+        a_coef = b_coef = np.nan
+        print(f"\nAffine fit on ref targets skipped: {ref_mask.sum()} targets, needs 3")
 
     affine_pred = a_coef * pred_depth + b_coef
 
@@ -183,6 +226,7 @@ def main():
     print(f"\nSaved per-point CSV: {csv_path}")
 
     summary = pd.DataFrame(results)
+    summary = summary[["label"] + [c for c in summary.columns if c != "label"]]
     summary_csv = os.path.join(args.output_dir, "scale_correction_summary.csv")
     summary.to_csv(summary_csv, index=False, float_format="%.4f")
     print(f"Saved summary CSV:   {summary_csv}")
@@ -192,182 +236,176 @@ def main():
         f.write("SCALE / AFFINE CORRECTION ANALYSIS\n")
         f.write(f"Source: {args.comparison_csv}\n\n")
 
-        f.write(
-            f"Scale factor (median gt/pred on {int(ref_mask.sum())} ref targets): "
-            f"{scale_factor:.4f}\n"
-        )
-        f.write(f"  => Predictions are {1 / scale_factor:.2f}x too large\n\n")
+        if np.isnan(scale_factor):
+            f.write("Scale factor: skipped, no reference target with a predicted depth\n\n")
+        else:
+            f.write(
+                f"Scale factor (median gt/pred on {n_targets(n_scale)}): "
+                f"{scale_factor:.4f}\n"
+            )
+            f.write(
+                f"  => predicted / GT depth at the reference targets: "
+                f"{1 / scale_factor:.2f}\n\n"
+            )
 
-        f.write(
-            f"Affine fit on ref targets: "
-            f"corrected = {a_coef:.4f} * pred + {b_coef:.4f}\n\n"
-        )
+        if np.isnan(a_coef):
+            f.write(
+                f"Affine fit on ref targets: skipped, {n_targets(int(ref_mask.sum()))} "
+                f"(needs 3)\n\n"
+            )
+        else:
+            f.write(
+                f"Affine fit on ref targets: "
+                f"corrected = {a_coef:.4f} * pred + {b_coef:.4f}\n\n"
+            )
 
         f.write("KEY COMPARISON:\n")
         f.write(
-            f"  Uncorrected  — RMSE={m_all['rmse']:.3f}m, "
+            f"  Uncorrected:  RMSE={m_all['rmse']:.3f}m, "
             f"Pearson={m_all['pearson_r']:.4f}, "
             f"Spearman={m_all['spearman_rho']:.4f}\n"
         )
-        f.write(
-            f"  Scale-corr   — RMSE={m_s_all['rmse']:.3f}m, "
-            f"Pearson={m_s_all['pearson_r']:.4f}, "
-            f"Spearman={m_s_all['spearman_rho']:.4f}\n"
-        )
-        f.write(
-            f"  Affine-corr  — RMSE={m_a_all['rmse']:.3f}m, "
-            f"Pearson={m_a_all['pearson_r']:.4f}, "
-            f"Spearman={m_a_all['spearman_rho']:.4f}\n\n"
-        )
-
-        f.write("NOTE: Correlation metrics (Pearson, Spearman) are unchanged by\n")
-        f.write("scale/affine correction — they only measure rank/linear agreement.\n")
-        f.write("The improvement shows in RMSE, MAE, and bias.\n")
+        if np.isnan(scale_factor):
+            f.write("  Scale-corr:   skipped\n")
+        else:
+            f.write(
+                f"  Scale-corr:   RMSE={m_s_all['rmse']:.3f}m, "
+                f"Pearson={m_s_all['pearson_r']:.4f}, "
+                f"Spearman={m_s_all['spearman_rho']:.4f}\n"
+            )
+        if np.isnan(a_coef):
+            f.write("  Affine-corr:  skipped\n")
+        else:
+            f.write(
+                f"  Affine-corr:  RMSE={m_a_all['rmse']:.3f}m, "
+                f"Pearson={m_a_all['pearson_r']:.4f}, "
+                f"Spearman={m_a_all['spearman_rho']:.4f}\n"
+            )
 
     print(f"Saved text report:   {txt_path}")
 
-    try:
-        import matplotlib
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-        def scatter_panel(ax, gt, pred, title, color="tab:blue"):
-            ax.scatter(
-                gt[trn_mask],
-                pred[trn_mask],
-                s=15,
-                alpha=0.5,
-                c="tab:blue",
-                label="transect",
-            )
-            ax.scatter(
-                gt[ref_mask],
-                pred[ref_mask],
-                s=60,
-                alpha=0.9,
-                c="red",
-                marker="*",
-                label="ref targets",
-                zorder=5,
-            )
-            lims = [min(gt.min(), pred.min()) - 0.1, max(gt.max(), pred.max()) + 0.1]
-            ax.plot(lims, lims, "k--", lw=1, alpha=0.5, label="1:1")
-            ax.set_xlabel("GT depth (m)")
-            ax.set_ylabel("Predicted depth (m)")
-            ax.set_title(title)
-            ax.legend(fontsize=7)
-            ax.grid(True, alpha=0.3)
-            ax.set_aspect("equal")
-
-        scatter_panel(axes[0], gt_depth, pred_depth, "Uncorrected")
-        scatter_panel(
-            axes[1], gt_depth, scaled_pred, f"Scale-corrected (x{scale_factor:.3f})"
+    def scatter_panel(ax, gt, pred, title, color="tab:blue"):
+        ax.scatter(
+            gt[trn_mask],
+            pred[trn_mask],
+            s=15,
+            alpha=0.5,
+            c="tab:blue",
+            label="transect",
         )
-        scatter_panel(
-            axes[2], gt_depth, affine_pred, f"Affine ({a_coef:.3f}*pred + {b_coef:.3f})"
+        ax.scatter(
+            gt[ref_mask],
+            pred[ref_mask],
+            s=60,
+            alpha=0.9,
+            c="red",
+            marker="*",
+            label="ref targets",
+            zorder=5,
         )
+        lims = [min(gt.min(), pred.min()) - 0.1, max(gt.max(), pred.max()) + 0.1]
+        ax.plot(lims, lims, "k--", lw=1, alpha=0.5, label="1:1")
+        ax.set_xlabel("GT depth (m)")
+        ax.set_ylabel("Predicted depth (m)")
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect("equal")
 
-        plt.tight_layout()
-        png_path = os.path.join(args.output_dir, "scale_correction_analysis.png")
-        plt.savefig(png_path, dpi=150)
-        plt.close()
-        print(f"Saved plot: {png_path}")
-    except Exception as e:
-        print(f"[WARN] Could not create plot: {e}")
+    scatter_panel(axes[0], gt_depth, pred_depth, "Uncorrected")
+    if np.isnan(scale_factor):
+        scale_title = "Scale-corrected (skipped, no ref targets)"
+    else:
+        scale_title = f"Scale-corrected (x{scale_factor:.3f})"
+    scatter_panel(axes[1], gt_depth, scaled_pred, scale_title)
+    if np.isnan(a_coef):
+        affine_title = "Affine (skipped, fewer than 3 ref targets)"
+    else:
+        affine_title = f"Affine ({a_coef:.3f}*pred + {b_coef:.3f})"
+    scatter_panel(axes[2], gt_depth, affine_pred, affine_title)
 
-    if args.bathymetry_csv and os.path.isfile(args.bathymetry_csv):
-        try:
-            bathy = pd.read_csv(args.bathymetry_csv)
-            required_cols = {"utm_easting", "utm_northing", "utm_elevation", "depth_m"}
-            if not required_cols.issubset(set(bathy.columns)):
-                print(
-                    f"[WARN] Bathymetry CSV missing columns: "
-                    f"{required_cols - set(bathy.columns)}"
-                )
-            else:
-                bathy_sc = bathy.copy()
-                bathy_sc["depth_m_orig"] = bathy_sc["depth_m"]
-                bathy_sc["depth_m"] = bathy_sc["depth_m"] * scale_factor
+    plt.tight_layout()
+    png_path = os.path.join(args.output_dir, "scale_correction_analysis.png")
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+    print(f"Saved plot: {png_path}")
 
-                if "wsm_elevation" in bathy_sc.columns:
-                    bathy_sc["utm_elevation"] = (
-                        bathy_sc["wsm_elevation"] - bathy_sc["depth_m"]
-                    )
-                else:
-                    surface = bathy_sc["utm_elevation"] + bathy_sc["depth_m_orig"]
-                    bathy_sc["utm_elevation"] = surface - bathy_sc["depth_m"]
+    if bathy is not None and np.isnan(scale_factor):
+        print("No scale-corrected PLY: no reference target with a predicted depth")
+    elif bathy is not None:
+        bathy_sc = bathy.copy()
+        bathy_sc["depth_m_orig"] = bathy_sc["depth_m"]
+        bathy_sc["depth_m"] = bathy_sc["depth_m"] * scale_factor
 
-                points = np.column_stack(
-                    [
-                        bathy_sc["utm_easting"].values,
-                        bathy_sc["utm_northing"].values,
-                        bathy_sc["utm_elevation"].values,
-                    ]
-                ).astype(np.float32)
+        if "wsm_elevation" in bathy_sc.columns:
+            bathy_sc["utm_elevation"] = bathy_sc["wsm_elevation"] - bathy_sc["depth_m"]
+        else:
+            surface = bathy_sc["utm_elevation"] + bathy_sc["depth_m_orig"]
+            bathy_sc["utm_elevation"] = surface - bathy_sc["depth_m"]
 
-                depth_vals = bathy_sc["depth_m"].values
-                d_min, d_max = np.nanmin(depth_vals), np.nanmax(depth_vals)
-                if d_max > d_min:
-                    norm = np.clip((depth_vals - d_min) / (d_max - d_min), 0, 1)
-                else:
-                    norm = np.zeros_like(depth_vals)
-                colors = np.zeros((len(norm), 3), dtype=np.uint8)
-                colors[:, 0] = (norm * 255).astype(np.uint8)
-                colors[:, 2] = ((1 - norm) * 255).astype(
-                    np.uint8
-                )
+        points = np.column_stack(
+            [
+                bathy_sc["utm_easting"].values,
+                bathy_sc["utm_northing"].values,
+                bathy_sc["utm_elevation"].values,
+            ]
+        ).astype(np.float32)
 
-                N = len(points)
-                ply_header = (
-                    "ply\n"
-                    "format binary_little_endian 1.0\n"
-                    f"element vertex {N}\n"
-                    "property float x\n"
-                    "property float y\n"
-                    "property float z\n"
-                    "property uchar red\n"
-                    "property uchar green\n"
-                    "property uchar blue\n"
-                    "end_header\n"
-                )
-                dtype = np.dtype(
-                    [
-                        ("x", "<f4"),
-                        ("y", "<f4"),
-                        ("z", "<f4"),
-                        ("red", "u1"),
-                        ("green", "u1"),
-                        ("blue", "u1"),
-                    ]
-                )
-                vertices = np.empty(N, dtype=dtype)
-                vertices["x"] = points[:, 0]
-                vertices["y"] = points[:, 1]
-                vertices["z"] = points[:, 2]
-                vertices["red"] = colors[:, 0]
-                vertices["green"] = colors[:, 1]
-                vertices["blue"] = colors[:, 2]
+        depth_vals = bathy_sc["depth_m"].values
+        d_min, d_max = np.nanmin(depth_vals), np.nanmax(depth_vals)
+        if d_max > d_min:
+            norm = np.clip((depth_vals - d_min) / (d_max - d_min), 0, 1)
+        else:
+            norm = np.zeros_like(depth_vals)
+        colors = np.zeros((len(norm), 3), dtype=np.uint8)
+        colors[:, 0] = (norm * 255).astype(np.uint8)
+        colors[:, 2] = ((1 - norm) * 255).astype(np.uint8)
 
+        N = len(points)
+        ply_header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {N}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        dtype = np.dtype(
+            [
+                ("x", "<f4"),
+                ("y", "<f4"),
+                ("z", "<f4"),
+                ("red", "u1"),
+                ("green", "u1"),
+                ("blue", "u1"),
+            ]
+        )
+        vertices = np.empty(N, dtype=dtype)
+        vertices["x"] = points[:, 0]
+        vertices["y"] = points[:, 1]
+        vertices["z"] = points[:, 2]
+        vertices["red"] = colors[:, 0]
+        vertices["green"] = colors[:, 1]
+        vertices["blue"] = colors[:, 2]
 
-                bathy_base = os.path.splitext(os.path.basename(args.bathymetry_csv))[0]
-                ply_path = os.path.join(
-                    os.path.dirname(args.bathymetry_csv),
-                    f"{bathy_base}_scale_corrected.ply",
-                )
-                with open(ply_path, "wb") as f:
-                    f.write(ply_header.encode("ascii"))
-                    vertices.tofile(f)
-                print(
-                    f"Saved scale-corrected PLY ({N} vertices, "
-                    f"scale={scale_factor:.4f}): {ply_path}"
-                )
-        except Exception as e:
-            print(f"[WARN] Could not create scale-corrected PLY: {e}")
-    elif args.bathymetry_csv:
-        print(f"[WARN] Bathymetry CSV not found: {args.bathymetry_csv}")
+        bathy_base = os.path.splitext(os.path.basename(args.bathymetry_csv))[0]
+        ply_path = os.path.join(
+            os.path.dirname(args.bathymetry_csv),
+            f"{bathy_base}_scale_corrected.ply",
+        )
+        with open(ply_path, "wb") as f:
+            f.write(ply_header.encode("ascii"))
+            vertices.tofile(f)
+        print(
+            f"Saved scale-corrected PLY ({N} vertices, "
+            f"scale={scale_factor:.4f}): {ply_path}"
+        )
 
     print("\nDone.")
 
