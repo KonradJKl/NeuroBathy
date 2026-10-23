@@ -1,28 +1,39 @@
 """
-Compute Umeyama similarity transform for georeferencing model outputs to UTM.
+Similarity transform (Umeyama) from a model frame to the projected CRS of the ground
+truth, fitted to the camera centres and the GPS positions of the same images.
+
+The camera centres come from COLMAP's images.bin (NeRFrac) or from VGGT's extrinsics,
+the GPS positions from the EXIF data of the source images or from the position priors
+of a COLMAP database. Images are matched by file name without extension, so PNG copies
+of the JPGs match. The GPS heights are used as recorded: they must be in the height
+system of the ground truth (ellipsoidal for the RTK-tagged Pielach images and ground
+truth).
+
+Writes scale, rotation and translation, and the RMS of the horizontal, vertical and 3D
+camera residuals, to --output. 02, 07 and 08 read it with --umeyama_npz.
 
 Usage examples:
-    # NeRFrac 50m (EXIF GPS)
+    # NeRFrac, oblique Pielach images
     python 01_compute_umeyama.py \\
         --mode nerfrac \\
-        --colmap_sparse_dir /path/to/sparse/0 \\
-        --image_dir /path/to/source/images \\
-        --output transforms/nerfrac_50m_umeyama.npz
+        --colmap_sparse_dir /path/to/pielach_oblique/sparse/0 \\
+        --image_dir /path/to/pielach_oblique/images \\
+        --output transforms/nerfrac_oblique_umeyama.npz
 
-    # VGGT 50m (EXIF GPS)
+    # VGGT, nadir Pielach images
     python 01_compute_umeyama.py \\
         --mode vggt \\
-        --vggt_dir /path/to/vggt_output \\
-        --image_dir /path/to/source/images \\
-        --output transforms/vggt_50m_umeyama.npz
+        --vggt_dir /path/to/vggt_nadir \\
+        --image_dir /path/to/pielach_data/images \\
+        --output transforms/vggt_nadir_umeyama.npz
 
-    # NeRFrac with COLMAP DB GPS fallback
+    # NeRFrac, GPS from the position priors of the COLMAP database
     python 01_compute_umeyama.py \\
         --mode nerfrac \\
-        --colmap_sparse_dir /path/to/sparse/0 \\
+        --colmap_sparse_dir /path/to/pielach_oblique/sparse/0 \\
         --gps_source colmap_db \\
-        --database_path /path/to/database.db \\
-        --output transforms/nerfrac_50m_umeyama.npz
+        --database_path /path/to/pielach_oblique/database.db \\
+        --output transforms/nerfrac_oblique_umeyama.npz
 """
 
 import argparse
@@ -35,7 +46,6 @@ from pyproj import CRS
 from pyproj.exceptions import CRSError
 
 from coord_utils import (
-    apply_umeyama,
     compute_umeyama_residuals,
     extract_colmap_camera_centers,
     extract_gps_from_colmap_db,
@@ -47,75 +57,65 @@ from coord_utils import (
     wgs84_dict_to_projected,
 )
 
+MIN_MATCHED_IMAGES = 3
+# below this ratio of the second to the first spread the cameras lie on a line
+MIN_SPREAD_RATIO = 0.05
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compute Umeyama similarity transform for georeferencing."
+        description="Similarity transform from a model frame to the CRS of the "
+        "ground truth."
     )
     parser.add_argument(
         "--mode",
         required=True,
         choices=["nerfrac", "vggt"],
-        help="Model type: nerfrac or vggt",
+        help="nerfrac: COLMAP camera centres; vggt: VGGT extrinsics",
     )
 
-    # Source of model camera positions
+    # camera centres
     parser.add_argument(
         "--colmap_sparse_dir",
         type=str,
         default="",
-        help="[nerfrac] Path to COLMAP sparse/0/ directory with images.bin",
+        help="COLMAP model folder with images.bin (nerfrac mode)",
     )
     parser.add_argument(
         "--vggt_dir",
         type=str,
         default="",
-        help="[vggt] Path to VGGT output directory with extrinsic_NNN.npy",
+        help="output folder of run_vggt_inference.py (vggt mode)",
     )
 
+    # GPS positions
     parser.add_argument(
         "--gps_source",
-        type=str,
-        default="exif",
         choices=["exif", "colmap_db"],
-        help="Where to read GPS from: 'exif' (source images) or 'colmap_db' (database.db)",
+        default="exif",
+        help="exif (default): the EXIF GPS of the images in --image_dir; colmap_db: "
+        "the position priors in --database_path",
     )
     parser.add_argument(
-        "--image_dir",
-        type=str,
-        default="",
-        help="[gps_source=exif] Directory with source JPEG images for GPS EXIF reading",
+        "--image_dir", type=str, default="", help="source images with EXIF GPS"
     )
     parser.add_argument(
         "--database_path",
         type=str,
         default="",
-        help="[gps_source=colmap_db] Path to COLMAP database.db",
+        help="COLMAP database.db with position priors (opened read-only)",
     )
-
-    # Target CRS
     parser.add_argument(
         "--target_epsg",
         type=int,
         default=25833,
-        help="EPSG code of the projected CRS of the ground truth. Default: 25833 "
-        "(ETRS89 / UTM 33N, the Pielach data).",
+        help="EPSG code of the projected CRS of the ground truth, in metres "
+        "(default: 25833, ETRS89 / UTM 33N, the Pielach data)",
     )
 
-    # Output
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Output .npz file path",
-    )
-
+    # output
+    parser.add_argument("--output", type=str, required=True, help="output .npz")
     return parser.parse_args()
-
-
-def _stem(name):
-    """Strip extension from filename."""
-    return os.path.splitext(name)[0]
 
 
 def check_target_crs(epsg):
@@ -129,164 +129,134 @@ def check_target_crs(epsg):
         sys.exit(1)
 
 
-def main():
-    args = parse_args()
-    check_target_crs(args.target_epsg)
-
-    print("=" * 60)
-    print(f"UMEYAMA ALIGNMENT  ({args.mode.upper()} -> EPSG:{args.target_epsg})")
-    print("=" * 60)
-
-    # Load model camera positions
-    print("\n ---Load model camera positions ---")
-
+def camera_centres(args):
+    """Camera centre per image name."""
     if args.mode == "nerfrac":
         if not os.path.isdir(args.colmap_sparse_dir):
             print(f"ERROR: --colmap_sparse_dir not found: {args.colmap_sparse_dir!r}")
             sys.exit(1)
-        model_positions = extract_colmap_camera_centers(args.colmap_sparse_dir)
-        print(f"Loaded {len(model_positions)} COLMAP camera centers")
+        centres = extract_colmap_camera_centers(args.colmap_sparse_dir)
+        print(f"COLMAP: {len(centres)} camera centres")
+        return centres
 
-    elif args.mode == "vggt":
-        if not os.path.isdir(args.vggt_dir):
-            print(f"ERROR: --vggt_dir not found: {args.vggt_dir!r}")
-            sys.exit(1)
+    if not os.path.isdir(args.vggt_dir):
+        print(f"ERROR: --vggt_dir not found: {args.vggt_dir!r}")
+        sys.exit(1)
+    centres = extract_vggt_camera_centers_from_extrinsics(args.vggt_dir)
+    names = load_vggt_image_names(args.vggt_dir)
+    if not names:
+        print(f"ERROR: No image_names in {args.vggt_dir}/metadata.json")
+        sys.exit(1)
+    if len(centres) < len(names):
+        print(
+            f"ERROR: {len(centres)} extrinsic files for {len(names)} images in "
+            "metadata.json"
+        )
+        sys.exit(1)
+    # extrinsics beyond the named views are left from an earlier, larger run
+    n_left_out = len(centres) - len(names)
+    note = f", {n_left_out} more extrinsic file(s) left out" if n_left_out else ""
+    print(f"VGGT: {len(names)} camera centres{note}")
+    return dict(zip(names, centres))
 
-        centers = extract_vggt_camera_centers_from_extrinsics(args.vggt_dir)
-        print(f"Loaded {len(centers)} VGGT camera positions from extrinsics")
 
-        # Map indices to image names
-        image_names = load_vggt_image_names(args.vggt_dir)
-        if not image_names:
-            print(f"ERROR: No image_names in {args.vggt_dir}/metadata.json")
-            sys.exit(1)
-        if len(centers) < len(image_names):
-            print(
-                f"ERROR: {len(centers)} extrinsic files for {len(image_names)} "
-                f"images in metadata.json"
-            )
-            sys.exit(1)
-        # extrinsics beyond the named views are left from an earlier, larger run
-        model_positions = dict(zip(image_names, centers))
-        print(f"Mapped {len(model_positions)} positions via metadata.json")
-
-    # Load GPS positions
-    print("\n ---Load GPS positions ---")
-
+def gps_positions(args):
+    """(lat, lon, height) per image name."""
     if args.gps_source == "exif":
         if not os.path.isdir(args.image_dir):
             print(f"ERROR: --image_dir not found: {args.image_dir!r}")
             sys.exit(1)
-        gps_wgs84 = read_all_exif_gps(args.image_dir)
-        print(f"Read {len(gps_wgs84)} GPS positions from EXIF")
-    else:
-        # sqlite would create an empty database at a wrong path
-        if not os.path.isfile(args.database_path):
-            print(f"ERROR: --database_path not found: {args.database_path!r}")
-            sys.exit(1)
-        gps_wgs84 = extract_gps_from_colmap_db(args.database_path)
-        print(f"Read {len(gps_wgs84)} GPS positions from COLMAP database")
+        gps = read_all_exif_gps(args.image_dir)
+        print(f"GPS: {len(gps)} images with EXIF GPS")
+        return gps
 
-    # Match model positions to GPS by image name
-    print("\n ---Match model <-> GPS ---")
+    # sqlite would create an empty database at a wrong path
+    if not os.path.isfile(args.database_path):
+        print(f"ERROR: --database_path not found: {args.database_path!r}")
+        sys.exit(1)
+    gps = extract_gps_from_colmap_db(args.database_path)
+    print(f"GPS: {len(gps)} position priors in the database")
+    return gps
 
-    # by file name without extension: the model may use PNG copies of the JPGs
-    model_stem_map = {_stem(n): n for n in model_positions}
-    gps_stem_map = {_stem(n): n for n in gps_wgs84}
-    common_stems = sorted(set(model_stem_map) & set(gps_stem_map))
-    for side, names in (("model", model_positions), ("GPS", gps_wgs84)):
-        counts = Counter(_stem(n) for n in names)
+
+def match_images(centres, gps):
+    """(model name, GPS name) pairs with the same file name without extension."""
+    model_by_stem = {os.path.splitext(n)[0]: n for n in centres}
+    gps_by_stem = {os.path.splitext(n)[0]: n for n in gps}
+    stems = sorted(set(model_by_stem) & set(gps_by_stem))
+    if len(stems) < MIN_MATCHED_IMAGES:
+        print(
+            f"ERROR: {len(stems)} images match between the model and the GPS, "
+            f"need {MIN_MATCHED_IMAGES}"
+        )
+        print(f"  model: {sorted(centres)[:5]}")
+        print(f"  GPS:   {sorted(gps)[:5]}")
+        sys.exit(1)
+    for side, names in (("model", centres), ("GPS", gps)):
+        stem_counts = Counter(os.path.splitext(n)[0] for n in names)
         doubled = sorted(
-            n for n in names if counts[_stem(n)] > 1 and _stem(n) in common_stems
+            n
+            for n in names
+            if stem_counts[os.path.splitext(n)[0]] > 1
+            and os.path.splitext(n)[0] in stems
         )
         if doubled:
             print(f"ERROR: {side} images that differ only in the extension: {doubled}")
             sys.exit(1)
-    if len(common_stems) < 3:
-        print(f"ERROR: {len(common_stems)} images match between model and GPS, need 3")
-        print(f"  Model names sample: {sorted(model_positions)[:5]}")
-        print(f"  GPS names sample:   {sorted(gps_wgs84)[:5]}")
-        sys.exit(1)
-    common = [model_stem_map[stem] for stem in common_stems]
-    gps_wgs84_matched = {
-        model_stem_map[stem]: gps_wgs84[gps_stem_map[stem]] for stem in common_stems
-    }
-    print(f"Matched {len(common)} images by file name")
 
-    if len(common) < len(model_positions):
-        n_missing = len(model_positions) - len(common)
-        print(f"  ({n_missing} model images have no GPS match)")
+    n_unmatched = len(centres) - len(stems)
+    note = f", {n_unmatched} model images have no GPS" if n_unmatched else ""
+    print(f"Matched {len(stems)} images{note}")
+    return [(model_by_stem[s], gps_by_stem[s]) for s in stems]
 
-    print(f"  GPS to EPSG:{args.target_epsg}")
-    gps_utm33 = wgs84_dict_to_projected(gps_wgs84_matched, args.target_epsg)
 
-    # This build aligned arrays
-    model_pts = np.array([model_positions[n] for n in common])
-    utm_pts = np.array([gps_utm33[n] for n in common])
+def main():
+    args = parse_args()
+    check_target_crs(args.target_epsg)
+    print(f"Umeyama transform ({args.mode} -> EPSG:{args.target_epsg})")
+    centres = camera_centres(args)
+    gps = gps_positions(args)
+    pairs = match_images(centres, gps)
+
+    projected = wgs84_dict_to_projected(
+        {name: gps[name] for _, name in pairs}, args.target_epsg
+    )
+    model_points = np.array([centres[model] for model, _ in pairs])
+    gps_points = np.array([projected[name] for _, name in pairs])
     # cameras along one line leave the rotation about that line undetermined
-    spread = np.linalg.svd(utm_pts - utm_pts.mean(axis=0), compute_uv=False)
-    if spread[1] < 0.05 * spread[0]:
+    spread = np.linalg.svd(gps_points - gps_points.mean(axis=0), compute_uv=False)
+    if spread[1] < MIN_SPREAD_RATIO * spread[0]:
         print("ERROR: The matched cameras lie almost on one line")
         sys.exit(1)
 
-    print(f"\nModel positions range:")
-    for ax, label in enumerate(["X", "Y", "Z"]):
-        print(
-            f"  {label}: [{model_pts[:, ax].min():.4f}, {model_pts[:, ax].max():.4f}]"
-        )
-    print(f"UTM33 GPS range:")
-    for ax, label in enumerate(["E", "N", "Z"]):
-        print(f"  {label}: [{utm_pts[:, ax].min():.2f}, {utm_pts[:, ax].max():.2f}]")
+    s, R, t = umeyama_alignment(model_points, gps_points)
+    stats = compute_umeyama_residuals(model_points, gps_points, s, R, t)
+    print(f"Scale {s:.6f}, translation [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]")
+    print(
+        f"Camera residuals: horizontal RMS {stats['xy_rms']:.3f} m (max "
+        f"{stats['max_xy']:.3f} m), vertical RMS {stats['z_rms']:.3f} m (max "
+        f"{stats['max_z']:.3f} m)"
+    )
 
-    # Umeyama alignment
-    print("\n ---Umeyama alignment ---")
-
-    s, R, t = umeyama_alignment(model_pts, utm_pts)
-
-    print(f"Scale:       {s:.10f}")
-    print(f"Rotation:\n{R}")
-    print(f"Translation: [{t[0]:.6f}, {t[1]:.6f}, {t[2]:.6f}]")
-
-    # Stats for thesis
-    stats = compute_umeyama_residuals(model_pts, utm_pts, s, R, t)
-    print(f"\nResiduals:")
-    print(f"  XY RMS:    {stats['xy_rms']:.4f} m")
-    print(f"  Z RMS:     {stats['z_rms']:.4f} m")
-    print(f"  Total RMS: {stats['total_rms']:.4f} m")
-    print(f"  Max XY:    {stats['max_xy']:.4f} m")
-    print(f"  Max Z:     {stats['max_z']:.4f} m")
-
-
-    print(f"\n ---Save to {args.output} ---")
-
+    # np.savez adds the extension
+    path = args.output if args.output.endswith(".npz") else args.output + ".npz"
+    print(f"Saving: {path}")
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-
     save_umeyama(
         args.output,
         s=s,
         R=R,
         t=t,
-        # no Z correction: the transformed cameras keep their flight height
+        # translation_raw and z_correction keep the format of the shipped transforms;
+        # there is no Z correction, the transformed cameras keep their GPS heights
         translation_raw=t,
         z_correction=0.0,
         xy_rms=stats["xy_rms"],
         z_rms=stats["z_rms"],
         total_rms=stats["total_rms"],
-        n_points=len(common),
+        n_points=len(pairs),
         mode=args.mode,
     )
-    print(f"Saved Umeyama transform ({len(common)} points, scale={s:.4f})")
-
-    # Results
-    print(f"\n{'=' * 60}")
-    print("Results")
-    print(f"{'=' * 60}")
-    print(f"  Mode:          {args.mode}")
-    print(f"  N points:      {len(common)}")
-    print(f"  Scale:         {s:.6f}")
-    print(f"  XY RMS:        {stats['xy_rms']:.4f} m")
-    print(f"  Z RMS:         {stats['z_rms']:.4f} m")
-    print(f"  Output:        {args.output}")
 
 
 if __name__ == "__main__":
