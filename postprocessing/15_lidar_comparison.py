@@ -4,28 +4,30 @@
 Usage:
     # Underwater depth comparison (default)
     python 15_lidar_comparison.py \\
-        --pred_csv bathymetry/bathymetry_nerfrac_obq_distort_mode_wsm.csv \\
-        --lidar_laz /path/to/Pielach_20241024_topoBathy_LiDAR.laz \\
-        --wsm_path /path/to/WSM.tif \\
+        --pred_csv bathymetry/bathymetry_nerfrac_50m.csv \\
+        --lidar_laz /path/to/03_LiDAR_topobathy_classified/Pielach_20241024_topoBathy_LiDAR.laz \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --compare underwater \\
-        --label "NeRFrac obq distort" \\
-        --output_dir validation_lidar/obq_distort_wsm
+        --label "NeRFrac 50m" \\
+        --output_dir validation_lidar/nerfrac_50m
 
     # Land elevation comparison
     python 15_lidar_comparison.py \\
-        --pred_csv bathymetry/bathymetry_nerfrac_obq_distort_mode_wsm.csv \\
-        --lidar_laz /path/to/Pielach_20241024_topoBathy_LiDAR.laz \\
-        --wsm_path /path/to/WSM.tif \\
+        --pred_npy pointclouds/nerfrac_50m/pointcloud_combined.npy \\
+        --lidar_laz /path/to/03_LiDAR_topobathy_classified/Pielach_20241024_topoBathy_LiDAR.laz \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --compare land \\
-        --output_dir validation_lidar/obq_distort_land
+        --label "NeRFrac 50m" \\
+        --output_dir validation_lidar/nerfrac_50m_land
 
     # Full terrain comparison (land + underwater)
     python 15_lidar_comparison.py \\
-        --pred_csv bathymetry/bathymetry_nerfrac_obq_distort_mode_wsm.csv \\
-        --lidar_laz /path/to/Pielach_20241024_topoBathy_LiDAR.laz \\
-        --wsm_path /path/to/WSM.tif \\
+        --pred_npy pointclouds/nerfrac_50m/pointcloud_combined.npy \\
+        --lidar_laz /path/to/03_LiDAR_topobathy_classified/Pielach_20241024_topoBathy_LiDAR.laz \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --compare full \\
-        --output_dir validation_lidar/obq_distort_full
+        --label "NeRFrac 50m" \\
+        --output_dir validation_lidar/nerfrac_50m_full
 """
 
 import argparse
@@ -60,10 +62,12 @@ def parse_args():
                         help="Path to Water Surface Model GeoTIFF")
     parser.add_argument("--compare", choices=["underwater", "land", "full"],
                         default="underwater",
-                        help="Comparison mode: underwater (class 40), land (class 2), "
-                             "or full (class 2+40). Default: underwater")
+                        help="Comparison mode: underwater (class 40), land (classes 2-5: "
+                             "ground and vegetation), or full (classes 2-5 and 40). Land and "
+                             "full only use cells inside the WSM footprint. Default: underwater")
     parser.add_argument("--grid_resolution", type=float, default=0.1,
-                        help="Grid cell size in meters (default: 0.1)")
+                        help="Grid cell size in meters, the same as for the --pred_csv "
+                             "grid (default: 0.1)")
     parser.add_argument("--label", type=str, default="")
     parser.add_argument("--output_dir", type=str,
                         default="validation_lidar/lidar_comparison")
@@ -78,26 +82,40 @@ def sample_wsm_vectorized(wsm_path, eastings, northings):
     return sample_wsm_batch(wsm_path, eastings, northings)
 
 
-def grid_points_fast(x, y, z, resolution, e_min, e_max, n_min, n_max):
-    n_cols = int(np.ceil((e_max - e_min) / resolution))
+def prediction_grid(e, n, resolution, centred):
+    """The prediction's own grid. centred: e, n are cell centres (the 02 CSV)."""
+    e0, n0 = e.min(), n.min()
+    if centred:
+        e0, n0 = e0 - resolution / 2, n0 - resolution / 2
+    n_cols = int((e.max() - e0) / resolution) + 1
+    n_rows = int((n.max() - n0) / resolution) + 1
+    return e0, n0, resolution, n_cols, n_rows
 
-    col_idx = np.clip(((x - e_min) / resolution).astype(np.int32), 0, n_cols - 1)
-    row_idx = np.clip(((y - n_min) / resolution).astype(np.int32), 0,
-                      int(np.ceil((n_max - n_min) / resolution)) - 1)
-    cell_id = row_idx * n_cols + col_idx
 
-    df = pd.DataFrame({"cell": cell_id, "z": z})
+def cell_ids(e, n, grid):
+    e0, n0, resolution, n_cols, n_rows = grid
+    col = np.floor((e - e0) / resolution).astype(np.int64)
+    row = np.floor((n - n0) / resolution).astype(np.int64)
+    inside = (col >= 0) & (col < n_cols) & (row >= 0) & (row < n_rows)
+    return row * n_cols + col, inside
+
+
+def cell_centres(cells, grid):
+    e0, n0, resolution, n_cols, _ = grid
+    return e0 + (cells % n_cols + 0.5) * resolution, n0 + (cells // n_cols + 0.5) * resolution
+
+
+def grid_points_fast(x, y, z, grid):
+    cell_id, inside = cell_ids(x, y, grid)
+
+    df = pd.DataFrame({"cell": cell_id[inside], "z": z[inside]})
     grouped = df.groupby("cell")["z"].agg(["median", "count"])
 
     cells = grouped.index.values
-    r = cells // n_cols
-    c = cells % n_cols
-    grid_e = e_min + (c + 0.5) * resolution
-    grid_n = n_min + (r + 0.5) * resolution
     grid_z = grouped["median"].values
     grid_count = grouped["count"].values.astype(int)
 
-    return grid_e, grid_n, grid_z, grid_count
+    return cells, grid_z, grid_count
 
 
 def compute_stats(pred, ref, label=""):
@@ -133,7 +151,7 @@ def print_stats(s, indent="  "):
     print(f"{indent}Std error:   {s['std_error']:.4f} m")
     print(f"{indent}R²:          {s['r2']:.4f}")
     print(f"{indent}Pearson r:   {s['pearson_r']:.4f}")
-    print(f"{indent}Spearman ρ:  {s['spearman_r']:.4f}")
+    print(f"{indent}Spearman rho: {s['spearman_r']:.4f}")
     print(f"{indent}Scale:       {s['scale_factor']:.3f}x")
 
 
@@ -144,12 +162,18 @@ def save_ply(path, e, n, z, scalar_fields):
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
     t0 = time.time()
 
-    label = args.label or os.path.basename(args.pred_csv).replace(".csv", "")
     res = args.grid_resolution
     mode = args.compare
+    pred_col = "depth_m" if mode == "underwater" else "utm_elevation"
+    use_npy = mode != "underwater" and bool(args.pred_npy)
+    if args.label:
+        label = args.label
+    elif use_npy:
+        label = os.path.basename(os.path.dirname(os.path.abspath(args.pred_npy)))
+    else:
+        label = os.path.splitext(os.path.basename(args.pred_csv))[0]
 
     class_map = {
         "underwater": [40],
@@ -163,44 +187,43 @@ def main():
                   "full": "Full Terrain"}[mode]
 
     print("=" * 70)
-    print(f"LIDAR COMPARISON ({mode_label}) — {label}")
+    print(f"LIDAR COMPARISON ({mode_label}): {label}")
     print("=" * 70)
 
     print("\n--- Step 1: Load prediction ---")
-    if mode == "underwater":
+    if not use_npy:
         if not args.pred_csv:
-            print("ERROR: --pred_csv required for underwater mode")
-            sys.exit(1)
-        pred = pd.read_csv(args.pred_csv)
-        print(f"  CSV: {len(pred):,} grid cells, depth=[{pred['depth_m'].min():.3f}, "
-              f"{pred['depth_m'].max():.3f}] m")
-    else:
-        npy_path = args.pred_npy
-        if not npy_path:
-            if not args.pred_csv:
+            if mode == "underwater":
+                print("ERROR: --pred_csv required for underwater mode")
+            else:
                 print("ERROR: --pred_npy (or --pred_csv) required for land/full mode")
-                sys.exit(1)
+            sys.exit(1)
+        if mode != "underwater":
             print("  WARNING: Using --pred_csv for land/full mode. This only has water cells.")
             print("  For full terrain, provide --pred_npy from 07_make_pointcloud.py")
-            pred = pd.read_csv(args.pred_csv)
-            print(f"  CSV: {len(pred):,} grid cells")
-        else:
-            print(f"  Loading pointcloud: {npy_path}")
-            pc = np.load(npy_path)
-            print(f"  {len(pc):,} points, Z=[{pc[:,2].min():.1f}, {pc[:,2].max():.1f}]")
-            pc_e, pc_n, pc_z = pc[:, 0], pc[:, 1], pc[:, 2]
-            pc_emin, pc_emax = pc_e.min(), pc_e.max()
-            pc_nmin, pc_nmax = pc_n.min(), pc_n.max()
-            pg_e, pg_n, pg_z, pg_count = grid_points_fast(
-                pc_e, pc_n, pc_z, res, pc_emin, pc_emax, pc_nmin, pc_nmax
-            )
-            print(f"  Gridded to {len(pg_e):,} cells")
-            pred = pd.DataFrame({
-                "utm_easting": pg_e, "utm_northing": pg_n,
-                "utm_elevation": pg_z, "depth_m": np.nan,
-                "n_observations": pg_count,
-            })
-            print(f"  Elevation range: [{pg_z.min():.2f}, {pg_z.max():.2f}]")
+        pred = pd.read_csv(args.pred_csv)
+        print(f"  CSV: {len(pred):,} grid cells")
+        pe = pred["utm_easting"].values
+        pn = pred["utm_northing"].values
+        pv = pred[pred_col].values
+        steps = np.concatenate([pe - pe.min(), pn - pn.min()]) / res
+        index = np.rint(steps).astype(np.int64)
+        # a coarser grid also lies on this lattice, but then all indices share a factor
+        if np.abs(steps - index).max() > 0.01 or np.gcd.reduce(index) > 1:
+            print(f"ERROR: The cells in {args.pred_csv} are not {res} m apart, "
+                  f"set --grid_resolution to the one used in 02")
+            sys.exit(1)
+        grid = prediction_grid(pe, pn, res, centred=True)
+        pred_cells, _ = cell_ids(pe, pn, grid)
+    else:
+        print(f"  Loading pointcloud: {args.pred_npy}")
+        pc = np.load(args.pred_npy)
+        print(f"  {len(pc):,} points, Z=[{pc[:,2].min():.1f}, {pc[:,2].max():.1f}]")
+        grid = prediction_grid(pc[:, 0], pc[:, 1], res, centred=False)
+        pred_cells, pv, _ = grid_points_fast(pc[:, 0], pc[:, 1], pc[:, 2], grid)
+        pe, pn = cell_centres(pred_cells, grid)
+        print(f"  Gridded to {len(pred_cells):,} cells")
+        print(f"  Elevation range: [{pv.min():.2f}, {pv.max():.2f}]")
 
     print("\n--- Step 2: Load LiDAR ---")
     las = laspy.read(args.lidar_laz)
@@ -214,83 +237,53 @@ def main():
     for c in lidar_classes:
         n_c = (lc == c).sum()
         print(f"    class {c} ({class_names.get(c, '?')}): {n_c:,}")
-
-    e_min = max(pred["utm_easting"].min(), lx.min())
-    e_max = min(pred["utm_easting"].max(), lx.max())
-    n_min = max(pred["utm_northing"].min(), ly.min())
-    n_max = min(pred["utm_northing"].max(), ly.max())
-
-    if e_min >= e_max or n_min >= n_max:
-        print("ERROR: No spatial overlap")
+    if not mask.any():
+        print(f"ERROR: No LiDAR points of classes {lidar_classes}")
         sys.exit(1)
 
-    print(f"\n  Overlap: E=[{e_min:.1f}, {e_max:.1f}], N=[{n_min:.1f}, {n_max:.1f}] "
-          f"({(e_max-e_min)*(n_max-n_min):.0f} m²)")
+    e0, n0, _, n_cols, n_rows = grid
+    print(f"\n  Prediction grid: E=[{e0:.1f}, {e0 + n_cols * res:.1f}], "
+          f"N=[{n0:.1f}, {n0 + n_rows * res:.1f}] ({n_cols} x {n_rows} cells)")
 
     print("\n--- Step 3: Grid LiDAR ---")
-    lg_e, lg_n, lg_z, lg_count = grid_points_fast(lx, ly, lz, res,
-                                                   e_min, e_max, n_min, n_max)
-    print(f"  {len(lg_e):,} cells, median pts/cell={int(np.median(lg_count))}")
+    lidar_cells, lg_z, lg_count = grid_points_fast(lx, ly, lz, grid)
+    if len(lidar_cells) == 0:
+        print("ERROR: No LiDAR point inside the prediction grid")
+        sys.exit(1)
+    print(f"  {len(lidar_cells):,} cells, median pts/cell={int(np.median(lg_count))}")
 
     print("\n--- Step 4: Compute reference values ---")
+    lg_e, lg_n = cell_centres(lidar_cells, grid)
     wsm_elev = sample_wsm_vectorized(args.wsm_path, lg_e, lg_n)
     valid = ~np.isnan(wsm_elev)
+    if not valid.any():
+        print("ERROR: No LiDAR cell lies on the WSM")
+        sys.exit(1)
 
     if mode == "underwater":
         lidar_ref = wsm_elev[valid] - lg_z[valid]
-        ref_label = "lidar_depth_m"
-        pred_col = "depth_m"
         value_label = "depth"
-    elif mode == "land":
-        lidar_ref = lg_z[valid]
-        ref_label = "lidar_elevation_m"
-        pred_col = "utm_elevation"
-        value_label = "elevation"
     else:
         lidar_ref = lg_z[valid]
-        ref_label = "lidar_elevation_m"
-        pred_col = "utm_elevation"
         value_label = "elevation"
+        print("  Land and full modes only use cells inside the WSM footprint")
 
-    lg_e_v, lg_n_v = lg_e[valid], lg_n[valid]
+    lidar_cells, wsm_elev = lidar_cells[valid], wsm_elev[valid]
     print(f"  {valid.sum():,} LiDAR cells with WSM, ref range="
           f"[{lidar_ref.min():.3f}, {lidar_ref.max():.3f}]")
 
     print("\n--- Step 5: Match cells ---")
-    n_cols = int(np.ceil((e_max - e_min) / res))
-
-    lidar_col = ((lg_e_v - e_min) / res).astype(np.int32)
-    lidar_row = ((lg_n_v - n_min) / res).astype(np.int32)
-    lidar_cell = lidar_row * n_cols + lidar_col
-
-    lidar_lookup = pd.Series(index=lidar_cell, data=np.arange(len(lidar_cell)))
-    lidar_lookup = lidar_lookup[~lidar_lookup.index.duplicated(keep="last")]
-
-    pe = pred["utm_easting"].values
-    pn = pred["utm_northing"].values
-    pv = pred[pred_col].values
-
-    in_overlap = (pe >= e_min) & (pe <= e_max) & (pn >= n_min) & (pn <= n_max)
-    pe, pn, pv = pe[in_overlap], pn[in_overlap], pv[in_overlap]
-
-    pred_col_idx = ((pe - e_min) / res).astype(np.int32)
-    pred_row_idx = ((pn - n_min) / res).astype(np.int32)
-    pred_cell = pred_row_idx * n_cols + pred_col_idx
-
-    common = np.intersect1d(pred_cell, lidar_lookup.index.values)
-    print(f"  Pred in overlap: {len(pe):,}, common cells: {len(common):,}")
-
-    # Build matched arrays
-    pred_cell_series = pd.Series(index=pred_cell, data=np.arange(len(pred_cell)))
-    pred_cell_series = pred_cell_series[~pred_cell_series.index.duplicated(keep="last")]
-
-    pred_idx = pred_cell_series.loc[common].values
-    lidar_idx = lidar_lookup.loc[common].values
+    # every prediction cell is compared with the LiDAR median of the same cell
+    pos = np.minimum(np.searchsorted(lidar_cells, pred_cells), len(lidar_cells) - 1)
+    pred_idx = np.flatnonzero(lidar_cells[pos] == pred_cells)
+    pred_idx = pred_idx[np.argsort(pred_cells[pred_idx], kind="stable")]
+    lidar_idx = pos[pred_idx]
+    print(f"  Prediction cells: {len(pred_cells):,}, with LiDAR: {len(pred_idx):,}")
 
     matched_pred_val = pv[pred_idx]
     matched_lidar_val = lidar_ref[lidar_idx]
-    matched_e = lg_e_v[lidar_idx]
-    matched_n = lg_n_v[lidar_idx]
+    matched_wsm = wsm_elev[lidar_idx]
+    matched_e, matched_n = pe[pred_idx], pn[pred_idx]
 
     if mode == "underwater":
         keep = (matched_pred_val > 0) & (matched_lidar_val > 0)
@@ -299,6 +292,7 @@ def main():
 
     matched_pred_val = matched_pred_val[keep]
     matched_lidar_val = matched_lidar_val[keep]
+    matched_wsm = matched_wsm[keep]
     matched_e = matched_e[keep]
     matched_n = matched_n[keep]
     print(f"  Final matched: {len(matched_pred_val):,}")
@@ -329,6 +323,7 @@ def main():
                   f"{ss['mae']:8.4f}  {ss['bias']:+8.4f}  {ss['spearman_r']:8.4f}")
 
     print(f"\n--- Step 8: Save outputs ---")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     comp_df = pd.DataFrame({
         "utm_easting": matched_e, "utm_northing": matched_n,
@@ -354,12 +349,13 @@ def main():
         f.write(f"RMSE:        {s['rmse']:.4f} m\nMAE:         {s['mae']:.4f} m\n")
         f.write(f"Bias:        {s['bias']:+.4f} m\nSpearman:    {s['spearman_r']:.4f}\n")
         f.write(f"Scale:       {s['scale_factor']:.3f}x\n")
+        if mode != "underwater":
+            f.write("Area:        cells inside the WSM footprint\n")
     print(f"  Saved: {txt_path}")
 
     ply_path = os.path.join(args.output_dir, "lidar_difference.ply")
     if mode == "underwater":
-        wsm_matched = sample_wsm_vectorized(args.wsm_path, matched_e, matched_n)
-        ply_z = wsm_matched - matched_pred_val
+        ply_z = matched_wsm - matched_pred_val
     else:
         ply_z = matched_pred_val
 
@@ -374,8 +370,12 @@ def main():
 
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.scatter(matched_lidar_val, matched_pred_val, s=0.3, alpha=0.05, c="steelblue")
-    lim = max(matched_lidar_val.max(), matched_pred_val.max()) * 1.05
-    ax.plot([0, lim], [0, lim], "k--", lw=1, label="1:1")
+    hi = max(matched_lidar_val.max(), matched_pred_val.max())
+    if mode == "underwater":
+        lo, hi = 0, hi * 1.05
+    else:
+        lo = min(matched_lidar_val.min(), matched_pred_val.min())
+    ax.plot([lo, hi], [lo, hi], "k--", lw=1, label="1:1")
     ax.set_xlabel(f"LiDAR {value_label} (m)")
     ax.set_ylabel(f"Predicted {value_label} (m)")
     ax.set_title(f"{label}\nRMSE={s['rmse']:.3f}m, ρ={s['spearman_r']:.3f}, "
@@ -388,13 +388,14 @@ def main():
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     vmax = np.percentile(matched_lidar_val, 99)
+    vmin = 0 if mode == "underwater" else np.percentile(matched_lidar_val, 1)
     for ax, vals, title in [
         (axes[0], matched_pred_val, f"Predicted {value_label} (m)"),
         (axes[1], matched_lidar_val, f"LiDAR {value_label} (m)"),
     ]:
         cmap = "viridis" if mode == "underwater" else "viridis_r"
         sc = ax.scatter(matched_e, matched_n, c=vals, s=0.2, cmap=cmap,
-                        vmin=0 if mode == "underwater" else vals.min(), vmax=vmax)
+                        vmin=vmin, vmax=vmax)
         ax.set_title(title)
         plt.colorbar(sc, ax=ax, shrink=0.7)
 

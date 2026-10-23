@@ -38,13 +38,13 @@ low, and without a scale correction their RMSE is 2.9 m or more.
 
 | Method | Images | Setup | Targets RMSE | All RMSE | All \|ρ\| | LiDAR RMSE | LiDAR \|ρ\| |
 |---|---|---|---:|---:|---:|---:|---:|
-| NeRFrac | 9 oblique | distortion loss, 256 samples | 0.54 | 0.34 | 0.48 | 0.49 | 0.39 |
+| NeRFrac | 9 oblique | distortion loss, 256 samples | 0.54 | 0.34 | 0.48 | 0.48 | 0.39 |
 | NeRFrac | 9 oblique | distortion loss, 64 samples | 0.51 | 0.46 | 0.27 | 0.49 | 0.21 |
-| NeRFrac | 9 oblique | 64 samples | 0.44 | 0.88 | 0.10 | 0.64 | 0.24 |
+| NeRFrac | 9 oblique | 64 samples | 0.44 | 0.88 | 0.10 | 0.65 | 0.24 |
 | NeRFrac | 280 nadir and oblique | distortion loss, 256 samples | 0.40 | 0.58 | 0.34 | 0.49 | 0.41 |
-| NeRFrac | 280 nadir and oblique | 256 samples | 0.45 | 1.09 | 0.35 | 1.05 | 0.44 |
-| VGGT | 9 nadir | no Snell correction | 0.27 | 0.59 | 0.16 | 0.56 | 0.08 |
-| VGGT | 9 nadir | multi-view Snell correction | 0.35 | 0.51 | 0.15 | 0.52 | 0.15 |
+| NeRFrac | 280 nadir and oblique | 256 samples | 0.45 | 1.09 | 0.35 | 1.04 | 0.44 |
+| VGGT | 9 nadir | no Snell correction | 0.27 | 0.59 | 0.16 | 0.57 | 0.08 |
+| VGGT | 9 nadir | multi-view Snell correction | 0.35 | 0.51 | 0.15 | 0.51 | 0.14 |
 
 No model wins every column. NeRFrac on the 9 oblique images with distortion loss and
 256 samples has the lowest RMSE on all points (0.34 m), most of which are shallow: only
@@ -78,7 +78,7 @@ images and 0.69 m for VGGT, see [`data/transforms`](data/transforms).
   the WSM). Measured below a plane fitted to its own surface, its RMSE is 2.72 m instead
   of 0.34 m. That is why the table uses the surveyed WSM.
 - NeRFrac and VGGT fail in opposite ways. Over the whole river, NeRFrac ranks depths
-  better (LiDAR |ρ| up to 0.44, VGGT 0.08 and 0.15). It overpredicts depth by a factor
+  better (LiDAR |ρ| up to 0.44, VGGT 0.08 and 0.14). It overpredicts depth by a factor
   of 1.2 for the best oblique model and by up to 34 for the nadir models. VGGT has the
   best RMSE on the 8 targets (0.27 m, bias +0.10 m) but ranks depths poorly. On the 20
   points deeper than 0.7 m this flips: the ranking of the best NeRFrac model inverts
