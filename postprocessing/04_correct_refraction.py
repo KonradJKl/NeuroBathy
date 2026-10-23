@@ -1,29 +1,39 @@
 """
-Analytical Snell's law refraction correction for VGGT depth predictions.
+Snell's law refraction correction of the VGGT water points.
 
-    # Multi-view correction
+The water surface is a plane fitted with RANSAC to the shoreline, the world points of
+the land pixels in a ring around the water mask. The ray from the camera to the
+apparent point of each water pixel is refracted where it crosses the plane, and the
+point is moved along the refracted ray to n_water times its apparent depth below the
+plane, the apparent-depth relation of a vertical view. Apparent points above the plane
+are left uncorrected.
+
+Modes:
+    single_view  one plane per view, from that view's shoreline
+    multi_view   one plane for all views, from the shoreline of all views
+    optimized    the multi_view plane, refined in height and tilt (Nelder-Mead) so
+                 that the corrected depths of the views agree on a grid
+
+The output folder holds the corrected world_points_NNN.npy, links to the unchanged
+per-view files, metadata.json and refraction_metadata.json, so that
+02_extract_bathymetry.py reads it like any VGGT folder.
+
+Usage example:
+    # VGGT nadir, one plane for all views
     python 04_correct_refraction.py \\
-        --vggt_dir  '/path/to/vggt_output' \\
-        --output_dir '/path/to/corrected_output' \\
-        --mask_dir  '/path/to/masks' \\
-        --mode multi_view
+        --vggt_dir /path/to/vggt_nadir \\
+        --mask_dir /path/to/pielach_data/masks \\
+        --mode multi_view \\
+        --output_dir refraction/vggt_nadir_multi_view
 
-    # Optimized correction
-    python 04_correct_refraction.py \\
-        --vggt_dir  '/path/to/vggt_output' \\
-        --output_dir '/path/to/corrected_output' \\
-        --mask_dir  '/path/to/masks' \\
-        --mode optimized
-
-    # Afterwards extract bathymetry from the corrected output:
-    python 02_extract_bathymetry.py --mode vggt \\
-        --vggt_dir '/path/to/corrected_output' \\
-        --umeyama_npz ../data/transforms/<umeyama.npz> \\
-        --wsm_path <WSM.tif> \\
-        --mask_dir '/path/to/masks' \\
-        --output_csv bathymetry/bathymetry_corrected.csv
-
-Pipeline position: runs AFTER 01_compute_umeyama.py, BEFORE 02_extract_bathymetry.py.
+    # then the bathymetry of the corrected folder
+    python 02_extract_bathymetry.py \\
+        --mode vggt \\
+        --vggt_dir refraction/vggt_nadir_multi_view \\
+        --umeyama_npz ../data/transforms/vggt_nadir_umeyama.npz \\
+        --mask_dir /path/to/pielach_data/masks \\
+        --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
+        --output_csv bathymetry/bathymetry_vggt_nadir_snell_mv.csv
 """
 
 import argparse
@@ -34,477 +44,528 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.ndimage import binary_dilation
 from scipy.optimize import minimize
 
-
 from coord_utils import WATER_MASK_THRESHOLD, discover_vggt_views
 
-N_WATER_DEFAULT = 1.333
+N_WATER = 1.333
+VGGT_PATCH_PX = 14
+MIN_SHORELINE_POINTS = 20
+# views with fewer rays that cross the plane are left out of the optimized-mode loss
+MIN_LOSS_POINTS = 10
+# per-view files the correction leaves unchanged; the output links them
+LINKED_FILES = [
+    "depth_{:03d}.npy",
+    "depth_conf_{:03d}.npy",
+    "extrinsic_{:03d}.npy",
+    "intrinsic_{:03d}.npy",
+    "rgb_{:03d}.png",
+    "world_points_conf_{:03d}.npy",
+]
 
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Snell's law refraction correction for VGGT outputs.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    parser = argparse.ArgumentParser(
+        description="Snell's law refraction correction of the VGGT water points."
     )
-    p.add_argument(
-        "--vggt_dir", type=str, required=True, help="Input VGGT output directory"
-    )
-    p.add_argument(
-        "--output_dir",
+
+    # inputs and output
+    parser.add_argument(
+        "--vggt_dir",
         type=str,
         required=True,
-        help="Output directory for corrected data",
+        help="output folder of run_vggt_inference.py",
     )
-    p.add_argument(
+    parser.add_argument(
         "--mask_dir",
         type=str,
         required=True,
-        help="Directory with water-mask PNGs (sorted order must match views)",
+        help="water mask PNGs, one per view, in view order when sorted by name",
     )
-    p.add_argument(
-        "--mode",
+    parser.add_argument(
+        "--output_dir",
         type=str,
-        default="multi_view",
-        choices=["single_view", "multi_view", "optimized"],
-        help="Correction mode",
+        required=True,
+        help="new folder for the corrected views, the --vggt_dir of 02",
     )
-    p.add_argument(
+
+    # correction
+    parser.add_argument(
+        "--mode",
+        choices=["single_view", "multi_view", "optimized"],
+        default="multi_view",
+        help="single_view: one plane per view; multi_view (default): one plane for "
+        "all views; optimized: the multi_view plane, refined for cross-view "
+        "consistency",
+    )
+    parser.add_argument(
         "--n_water",
         type=float,
-        default=N_WATER_DEFAULT,
-        help="Refractive index of water",
+        default=N_WATER,
+        help=f"refractive index of the water, at least 1 (default: {N_WATER})",
     )
-    p.add_argument(
-        "--shoreline_buffer",
-        type=int,
-        default=1,
-        help="Mask dilation radius (pixels) for shoreline extraction",
-    )
-    p.add_argument(
+    parser.add_argument(
         "--mask_threshold",
         type=int,
         default=WATER_MASK_THRESHOLD,
-        help="Threshold for binary mask (>threshold = water)",
+        help=f"mask values above this are water (default: {WATER_MASK_THRESHOLD})",
     )
-    p.add_argument(
+    parser.add_argument(
+        "--shoreline_buffer",
+        type=int,
+        default=1,
+        help="width of the shoreline ring around the water mask, in px (default: 1)",
+    )
+    parser.add_argument(
         "--ransac_iterations",
         type=int,
         default=2000,
-        help="RANSAC iterations for plane fitting",
+        help="RANSAC iterations of the plane fit (default: 2000)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--ransac_threshold",
         type=float,
         default=None,
-        help="RANSAC inlier distance threshold (auto if None)",
+        help="RANSAC inlier distance in VGGT units (default: the larger of twice the "
+        "median and the 75th percentile of the distances to a least-squares plane)",
     )
-    p.add_argument(
+
+    # optimized mode
+    parser.add_argument(
         "--opt_subsample_views",
         type=int,
         default=0,
-        help="Use about this many evenly spaced views for optimisation (0 = all)",
+        help="use every (number of views // N)-th view, so at least N views "
+        "(default: 0, all views)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--opt_subsample_pixels",
         type=int,
         default=4,
-        help="Use every Nth water pixel for optimisation",
+        help="use every Nth water pixel of a view (default: 4)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--opt_grid_res",
         type=float,
         default=0.01,
-        help="2-D grid cell size (VGGT units) for optimisation loss",
+        help="cell size of the grid that pairs the views, in VGGT units "
+        "(default: 0.01)",
     )
-    args = p.parse_args()
+    args = parser.parse_args()
     if args.n_water < 1:
-        p.error("--n_water must be at least 1")
+        parser.error("--n_water must be at least 1")
     if args.ransac_threshold is not None and args.ransac_threshold <= 0:
-        p.error("--ransac_threshold must be positive")
+        parser.error("--ransac_threshold must be positive")
     if args.opt_grid_res <= 0:
-        p.error("--opt_grid_res must be positive")
+        parser.error("--opt_grid_res must be positive")
     return args
 
 
-def load_mask(mask_path, target_H, target_W, threshold):
-    import cv2
-
-    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if m is None:
-        raise FileNotFoundError(f"Cannot read mask: {mask_path}")
-    # VGGT scales the width to its frame and rounds the height to its 14 px patches;
-    # a larger mismatch means it cropped or padded the image, and a resize misaligns
-    if abs(m.shape[0] * target_W / m.shape[1] - target_H) > 7:
-        raise ValueError(
-            f"Mask {Path(mask_path).name} ({m.shape[1]} x {m.shape[0]}) does not fit "
-            f"the VGGT frame ({target_W} x {target_H}): VGGT cropped or padded the images"
+def load_views(vggt_dir, indices):
+    views = []
+    for idx in indices:
+        extrinsic = np.load(vggt_dir / f"extrinsic_{idx:03d}.npy")
+        R, t = extrinsic[:3, :3], extrinsic[:3, 3]
+        views.append(
+            {
+                "index": idx,
+                "world_points": np.load(vggt_dir / f"world_points_{idx:03d}.npy"),
+                "C": -R.T @ t,  # camera centre, extrinsics are camera-from-world
+            }
         )
-    if m.shape[0] != target_H or m.shape[1] != target_W:
-        m = cv2.resize(m, (target_W, target_H), interpolation=cv2.INTER_NEAREST)
-    return m > threshold
+    return views
 
 
-def load_all_masks(mask_dir, n_views, target_H, target_W, threshold):
-    mask_files = sorted(Path(mask_dir).glob("*.png"))
-    if len(mask_files) == 0:
-        raise FileNotFoundError(f"No PNG masks in {mask_dir}")
-    if len(mask_files) != n_views:
-        raise ValueError(f"{len(mask_files)} masks in {mask_dir} for {n_views} views")
-    masks = []
-    for i in range(n_views):
-        masks.append(load_mask(mask_files[i], target_H, target_W, threshold))
-    print(
-        f"  Loaded {n_views} masks from {mask_dir}  (resized to {target_H}x{target_W})"
-    )
-    return masks
+def load_mask(path, H, W, threshold):
+    mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        print(f"ERROR: Cannot read mask {path}")
+        sys.exit(1)
+    # VGGT scales the width to its frame and rounds the height to its patches; a
+    # larger mismatch means it cropped or padded the image, and a resize misaligns
+    if abs(mask.shape[0] * W / mask.shape[1] - H) > VGGT_PATCH_PX / 2:
+        print(
+            f"ERROR: Mask {path.name} ({mask.shape[1]} x {mask.shape[0]}) does not "
+            f"have the aspect ratio of the VGGT frame ({W} x {H})"
+        )
+        sys.exit(1)
+    if mask.shape != (H, W):
+        mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+    return mask > threshold
 
 
-def camera_centre(extrinsic):
-    R = extrinsic[:3, :3]
-    t = extrinsic[:3, 3]
-    return -R.T @ t
+def load_masks(mask_dir, n_views, H, W, threshold):
+    if not os.path.isdir(mask_dir):
+        print(f"ERROR: Mask directory not found: {mask_dir}")
+        sys.exit(1)
+    paths = sorted(Path(mask_dir).glob("*.png"))
+    if len(paths) != n_views:
+        print(f"ERROR: {len(paths)} masks in {mask_dir} for {n_views} views")
+        sys.exit(1)
+    print(f"Masks: {n_views} from {mask_dir}")
+    return [load_mask(p, H, W, threshold) for p in paths]
 
 
-def extract_shoreline_points(world_points, water_mask, buffer_px=1):
-    struct = np.ones((2 * buffer_px + 1, 2 * buffer_px + 1), dtype=bool)
-    dilated = binary_dilation(water_mask, structure=struct)
-    ring = dilated & (~water_mask)
-    valid = ring & np.isfinite(world_points).all(axis=2)
-    return world_points[valid], valid
+def water_pixels(view):
+    return np.where(view["water_mask"] & np.isfinite(view["world_points"]).all(axis=2))
 
 
-def fit_plane_ransac(points, n_iter=2000, threshold=None, seed=42):
+def shoreline_points(view, buffer_px):
+    size = 2 * buffer_px + 1
+    water = view["water_mask"]
+    ring = binary_dilation(water, structure=np.ones((size, size), dtype=bool)) & ~water
+    points = view["world_points"]
+    return points[ring & np.isfinite(points).all(axis=2)]
+
+
+def svd_plane(points):
+    centroid = points.mean(axis=0)
+    _, _, Vh = np.linalg.svd(points - centroid, full_matrices=False)
+    return Vh[-1], -Vh[-1] @ centroid
+
+
+def fit_plane_ransac(points, n_iter, threshold=None, seed=42):
+    """RANSAC plane normal . P + d = 0, refitted by SVD on its inliers.
+
+    Returns the plane, the number of inliers, the std of their residuals and the
+    inlier threshold used.
+    """
     rng = np.random.default_rng(seed)
-    N = len(points)
-    if N < 3:
-        raise ValueError(f"Need >= 3 points for plane fitting, got {N}")
-
     if threshold is None:
-        centroid = points.mean(axis=0)
-        _, _, Vh = np.linalg.svd(points - centroid, full_matrices=False)
-        n0 = Vh[-1]
-        d0 = -n0 @ centroid
-        dists = np.abs(points @ n0 + d0)
+        normal, d = svd_plane(points)
+        dists = np.abs(points @ normal + d)
         threshold = max(2.0 * np.median(dists), np.percentile(dists, 75), 1e-8)
 
-    best_count, best_n, best_d = 0, None, None
+    best_count, best = 0, None
     for _ in range(n_iter):
-        idx = rng.choice(N, 3, replace=False)
-        v1 = points[idx[1]] - points[idx[0]]
-        v2 = points[idx[2]] - points[idx[0]]
-        n = np.cross(v1, v2)
-        nrm = np.linalg.norm(n)
-        if nrm < 1e-12:
+        p0, p1, p2 = points[rng.choice(len(points), 3, replace=False)]
+        normal = np.cross(p1 - p0, p2 - p0)
+        length = np.linalg.norm(normal)
+        if length < 1e-12:  # collinear sample
             continue
-        n /= nrm
-        d = -n @ points[idx[0]]
-        cnt = np.sum(np.abs(points @ n + d) < threshold)
-        if cnt > best_count:
-            best_count, best_n, best_d = cnt, n, d
+        normal /= length
+        d = -normal @ p0
+        count = np.sum(np.abs(points @ normal + d) < threshold)
+        if count > best_count:
+            best_count, best = count, (normal, d)
+    normal, d = best if best is not None else svd_plane(points)
 
-    if best_n is None:
-        centroid = points.mean(axis=0)
-        _, _, Vh = np.linalg.svd(points - centroid, full_matrices=False)
-        best_n = Vh[-1]
-        best_d = -best_n @ centroid
-
-    mask = np.abs(points @ best_n + best_d) < threshold
-    if mask.sum() >= 3:
-        inlier_pts = points[mask]
-        c = inlier_pts.mean(axis=0)
-        _, _, Vh = np.linalg.svd(inlier_pts - c, full_matrices=False)
-        normal = Vh[-1]
-        d = -normal @ c
-    else:
-        normal, d = best_n, best_d
-
+    close = np.abs(points @ normal + d) < threshold
+    if close.sum() >= 3:
+        normal, d = svd_plane(points[close])
     residuals = points @ normal + d
-    mask = np.abs(residuals) < threshold
-    res_std = float(np.std(residuals[mask])) if mask.any() else float("inf")
-    return normal, d, mask, res_std, threshold
+    inliers = np.abs(residuals) < threshold
+    res_std = float(np.std(residuals[inliers])) if inliers.any() else float("inf")
+    return normal, d, int(inliers.sum()), res_std, threshold
 
 
-def orient_normal_toward_cameras(normal, d, camera_positions):
-    """Flip normal so it points toward the camera centroid (= air side)."""
-    cam_centroid = camera_positions.mean(axis=0)
-    if normal @ cam_centroid + d < 0:
-        normal, d = -normal, -d
+def orient_toward_cameras(normal, d, camera_positions):
+    """Flip the plane so that the camera centroid, the air side, is in front of it."""
+    if normal @ camera_positions.mean(axis=0) + d < 0:
+        return -normal, -d
     return normal, d
 
 
-def snell_correct_view(
-    world_points,
-    water_mask,
-    C,
-    plane_normal,
-    plane_d,
-    n_water=N_WATER_DEFAULT,
-):
-    H, W = water_mask.shape
-    corrected = world_points.copy()
+def trace_to_plane(C, rays, normal, d):
+    """Where the rays from C cross the plane; valid marks those that cross it ahead."""
+    n_dot_ray = rays @ normal
+    valid = np.abs(n_dot_ray) > 1e-12
+    t_surface = np.full(len(rays), np.inf)
+    t_surface[valid] = -(normal @ C + d) / n_dot_ray[valid]
+    valid &= t_surface > 0
+    return C + t_surface[:, None] * rays, valid
 
-    wy, wx = np.where(water_mask & np.isfinite(world_points).all(axis=2))
+
+def unit(vectors):
+    return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+
+
+def snell_correct(view, normal, d, n_water):
+    """Correct the water points of a view at the plane normal . P + d = 0.
+
+    The normal points to the air side. Returns the corrected world points and the
+    stats of the view.
+    """
+    corrected = view["world_points"].copy()
+    wy, wx = water_pixels(view)
     N = len(wy)
     if N == 0:
         return corrected, {"n_water": 0, "n_corrected": 0, "n_skipped": 0}
 
-    # the apparent points come from the same arrays as the shoreline points, so a
-    # point-map run is corrected on its own geometry
-    P_app = world_points[wy, wx].astype(np.float64)
-    dirs_unnorm = P_app - C[None, :]  # (N, 3)
+    C = view["C"]
+    P_app = view["world_points"][wy, wx].astype(np.float64)
+    rays = P_app - C
+    P_surf, valid = trace_to_plane(C, rays, normal, d)
 
-    n_dot_dir = dirs_unnorm @ plane_normal  # (N,)
-    n_dot_C_d = plane_normal @ C + plane_d
+    incident = unit(rays)
+    signed_cos_i = incident @ normal
+    cos_i = np.clip(np.abs(signed_cos_i), 0.0, 1.0)
+    sin_r = np.sqrt(1.0 - cos_i**2) / n_water
+    cos_r = np.sqrt(np.maximum(1.0 - sin_r**2, 0.0))
+    valid &= (sin_r <= 1.0) & (cos_r > 1e-12)
 
-    safe = np.abs(n_dot_dir) > 1e-12
-    t_surface = np.full(N, np.inf)
-    t_surface[safe] = -n_dot_C_d / n_dot_dir[safe]
-
-    valid = safe & (t_surface > 0)
-
-    P_surf = C[None, :] + t_surface[:, None] * dirs_unnorm  # (N, 3)
-
-    dir_norms = np.linalg.norm(dirs_unnorm, axis=1, keepdims=True)
-    dirs_norm = dirs_unnorm / np.maximum(dir_norms, 1e-12)
-    cos_theta_i = np.abs(dirs_norm @ plane_normal)
-    cos_theta_i = np.clip(cos_theta_i, 0.0, 1.0)
-    sin_theta_i = np.sqrt(1.0 - cos_theta_i**2)
-
-    sin_theta_r = sin_theta_i / n_water
-    valid &= sin_theta_r <= 1.0
-    cos_theta_r = np.sqrt(np.maximum(1.0 - sin_theta_r**2, 0.0))
-
-    # vector Snell's law
-    sign = -np.sign(dirs_norm @ plane_normal)  # (N,)
-    n_hat = sign[:, None] * plane_normal[None, :]  # (N, 3)
+    # vector form of Snell's law, with the normal on the side of the incoming ray
     eta = 1.0 / n_water
-    dir_refr = eta * dirs_norm + (eta * cos_theta_i - cos_theta_r)[:, None] * n_hat
-    ref_len = np.linalg.norm(dir_refr, axis=1, keepdims=True)
-    valid &= ref_len.squeeze() > 1e-12
-    dir_refr /= np.maximum(ref_len, 1e-12)
+    n_hat = -np.sign(signed_cos_i)[:, None] * normal
+    refracted = eta * incident + (eta * cos_i - cos_r)[:, None] * n_hat
+    length = np.linalg.norm(refracted, axis=1, keepdims=True)
+    valid &= length[:, 0] > 1e-12
+    refracted /= np.maximum(length, 1e-12)
 
-    # correct point 3-D position; apparent points above the surface stay uncorrected
-    signed_dist_to_plane = -(P_app @ plane_normal + plane_d)  # >0 = below surface
-    d_uw = np.abs(signed_dist_to_plane) / np.maximum(cos_theta_i, 1e-12)
-    valid &= signed_dist_to_plane > 1e-12
-    depth_perp_app = np.abs(signed_dist_to_plane)
-    depth_perp_true = depth_perp_app * n_water
-    valid &= cos_theta_r > 1e-12
+    # n_water times the apparent depth below the plane: exact for a vertical ray,
+    # an underestimate for oblique ones
+    depth_app = -(P_app @ normal + d)
+    valid &= depth_app > 1e-12
     t_true = np.zeros(N)
-    t_true[valid] = depth_perp_true[valid] / cos_theta_r[valid]
-
-    P_true = P_surf + t_true[:, None] * dir_refr
+    t_true[valid] = depth_app[valid] * n_water / cos_r[valid]
+    P_true = P_surf + t_true[:, None] * refracted
     corrected[wy[valid], wx[valid]] = P_true[valid]
 
-    n_above_plane = int((signed_dist_to_plane < 0).sum())
-    if valid.any():
-        angles = np.degrees(np.arccos(cos_theta_i[valid]))
-        disp = np.linalg.norm(P_true[valid] - P_app[valid], axis=1)
-        stats = {
-            "n_water": int(N),
-            "n_corrected": int(valid.sum()),
-            "n_skipped": int((~valid).sum()),
-            "n_above_plane": n_above_plane,
-            "mean_incidence_deg": round(float(angles.mean()), 2),
-            "max_incidence_deg": round(float(angles.max()), 2),
-            "mean_displacement": round(float(disp.mean()), 6),
-        }
-    else:
-        stats = {"n_water": int(N), "n_corrected": 0, "n_skipped": int(N)}
-    return corrected, stats
+    if not valid.any():
+        return corrected, {"n_water": N, "n_corrected": 0, "n_skipped": N}
+    incidence_deg = np.degrees(np.arccos(cos_i[valid]))
+    displacement = np.linalg.norm(P_true[valid] - P_app[valid], axis=1)
+    return corrected, {
+        "n_water": N,
+        "n_corrected": int(valid.sum()),
+        "n_skipped": int((~valid).sum()),
+        "n_above_plane": int((depth_app < 0).sum()),
+        "mean_incidence_deg": round(float(incidence_deg.mean()), 2),
+        "max_incidence_deg": round(float(incidence_deg.max()), 2),
+        "mean_displacement": round(float(displacement.mean()), 6),
+    }
 
 
-def _build_opt_data(views_data, sub_views=0, sub_px=4):
-    """Pre-compute lightweight arrays for the optimiser."""
-    n = len(views_data)
-    use = list(range(n))
-    if 0 < sub_views < n:
-        use = list(range(0, n, max(1, n // sub_views)))
-
-    out = []
-    for vi in use:
-        vd = views_data[vi]
-        mask = vd["water_mask"]
-        wy, wx = np.where(mask & np.isfinite(vd["world_points"]).all(axis=2))
-        if len(wy) == 0:
-            continue
-        if sub_px > 1:
-            sel = np.arange(0, len(wy), sub_px)
-            wy, wx = wy[sel], wx[sel]
-        C = vd["C"]
-        P_app = vd["world_points"][wy, wx].astype(np.float64)
-        dirs_unnorm = P_app - C[None, :]
-        out.append(
-            {
-                "C": C,
-                "dirs_unnorm": dirs_unnorm,
-                "P_app": P_app,
-                "vi": vi,
-            }
-        )
-    return out
-
-
-def _opt_loss(params, opt_data, base_normal, base_d, n_water, grid_res):
+def tilted_plane(normal, d, params):
+    """The plane raised by dh along its normal, which is turned by dtx about x and
+    then by dty about y (radians)."""
     dh, dtx, dty = params
     cx, sx = np.cos(dtx), np.sin(dtx)
     cy, sy = np.cos(dty), np.sin(dty)
     Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
     Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-    normal = Ry @ Rx @ base_normal
-    normal /= np.linalg.norm(normal)
-    d = base_d - dh
+    tilted = Ry @ Rx @ normal
+    return tilted / np.linalg.norm(tilted), d - dh
 
-    all_keys = []
-    all_depths = []
-    all_views = []
 
-    for vd in opt_data:
-        C = vd["C"]
-        dirs = vd["dirs_unnorm"]
-        P_app = vd["P_app"]
-        N = len(P_app)
-
-        n_dot_dir = dirs @ normal
-        safe = np.abs(n_dot_dir) > 1e-12
-        t_surf = np.full(N, np.inf)
-        t_surf[safe] = -(normal @ C + d) / n_dot_dir[safe]
-        valid = safe & (t_surf > 0)
-        if valid.sum() < 10:
+def optimization_samples(views, n_sample_views, pixel_step):
+    """Every pixel_step-th water point of the views the optimisation uses."""
+    view_ids = range(len(views))
+    if 0 < n_sample_views < len(views):
+        view_ids = range(0, len(views), len(views) // n_sample_views)
+    samples = []
+    for vi in view_ids:
+        wy, wx = water_pixels(views[vi])
+        if len(wy) == 0:
             continue
+        if pixel_step > 1:
+            wy, wx = wy[::pixel_step], wx[::pixel_step]
+        P_app = views[vi]["world_points"][wy, wx].astype(np.float64)
+        C = views[vi]["C"]
+        samples.append({"C": C, "rays": P_app - C, "P_app": P_app, "view": vi})
+    return samples
 
-        P_surf = C[None, :] + t_surf[:, None] * dirs
-        dir_norms = np.linalg.norm(dirs, axis=1, keepdims=True)
-        dirs_n = dirs / np.maximum(dir_norms, 1e-12)
-        cos_ti = np.clip(np.abs(dirs_n @ normal), 0, 1)
-        sin_ti = np.sqrt(1 - cos_ti**2)
-        sin_tr = sin_ti / n_water
-        valid &= sin_tr <= 1.0
-        cos_tr = np.sqrt(np.maximum(1 - sin_tr**2, 0))
 
-        signed_dist = -(P_app @ normal + d)
+def cross_view_variance(params, samples, normal, d, n_water, grid_res):
+    """Loss of the optimized mode: in each grid cell seen from two or more views, the
+    variance of the views' mean corrected depth, averaged over these cells; inf when
+    no cell is seen from two views."""
+    normal, d = tilted_plane(normal, d, params)
+    cells = defaultdict(lambda: defaultdict(list))
+    for sample in samples:
+        P_surf, valid = trace_to_plane(sample["C"], sample["rays"], normal, d)
+        if valid.sum() < MIN_LOSS_POINTS:
+            continue
+        cos_i = np.clip(np.abs(unit(sample["rays"]) @ normal), 0, 1)
+        sin_r = np.sqrt(1 - cos_i**2) / n_water
+        cos_r = np.sqrt(np.maximum(1 - sin_r**2, 0))
+        depth_app = -(sample["P_app"] @ normal + d)
         # unlike the correction, the loss keeps the points above the plane: without
         # them the plane could lower the loss by moving away from all points
-        valid &= (np.abs(signed_dist) > 1e-12) & (cos_tr > 1e-12)
-        depth_perp = np.abs(signed_dist) * n_water
+        valid &= (sin_r <= 1.0) & (np.abs(depth_app) > 1e-12) & (cos_r > 1e-12)
+        keys = np.floor(P_surf[valid, :2] / grid_res).astype(np.int64)
+        depths = np.abs(depth_app[valid]) * n_water
+        for key, depth in zip(map(tuple, keys.tolist()), depths.tolist()):
+            cells[key][sample["view"]].append(depth)
 
-        uv = np.floor(P_surf[valid, :2] / grid_res).astype(np.int64)
-        all_keys.append(uv)
-        all_depths.append(depth_perp[valid])
-        all_views.append(np.full(valid.sum(), vd["vi"], dtype=np.int32))
-
-    if not all_keys:
+    variances = [
+        np.var([np.mean(view_depths) for view_depths in per_view.values()])
+        for per_view in cells.values()
+        if len(per_view) > 1
+    ]
+    if not variances:
         return np.inf
-
-    all_keys = np.concatenate(all_keys, axis=0)
-    all_depths = np.concatenate(all_depths)
-    all_views = np.concatenate(all_views)
-
-    cells = defaultdict(lambda: defaultdict(list))
-    for i in range(len(all_keys)):
-        cells[(all_keys[i, 0], all_keys[i, 1])][all_views[i]].append(all_depths[i])
-
-    total_var = 0.0
-    n_cells = 0
-    for view_depths in cells.values():
-        if len(view_depths) < 2:
-            continue
-        means = [np.mean(dl) for dl in view_depths.values()]
-        total_var += np.var(means)
-        n_cells += 1
-
-    # without a cell seen twice there is nothing to compare, not a perfect fit
-    if n_cells == 0:
-        return np.inf
-    return total_var / n_cells
+    return sum(variances) / len(variances)
 
 
-def optimize_water_surface(
-    views_data, base_normal, base_d, n_water, sub_views, sub_px, grid_res
-):
-    print("\n --- Optimising water surface plane --")
-    opt_data = _build_opt_data(views_data, sub_views, sub_px)
-    total_pts = sum(len(vd["P_app"]) for vd in opt_data)
-    print(f"    Optimisation data: {len(opt_data)} views, {total_pts:,} points")
-
-    loss0 = _opt_loss([0, 0, 0], opt_data, base_normal, base_d, n_water, grid_res)
-    if not np.isfinite(loss0):
-        print("    No grid cell is seen from two views; keeping the RANSAC plane")
-        return base_normal, base_d, None
-    print(f"    Initial cross-view depth variance: {loss0:.8f}")
-
+def optimize_plane(views, normal, d, args):
+    """Refine the plane by Nelder-Mead on cross_view_variance; the plane stays as it
+    is when no grid cell is seen from two views. Returns the plane and its stats."""
+    samples = optimization_samples(
+        views, args.opt_subsample_views, args.opt_subsample_pixels
+    )
+    n_points = sum(len(s["P_app"]) for s in samples)
+    print(f"Optimising the plane on {len(samples)} view(s), {n_points:,} points")
+    loss_args = (samples, normal, d, args.n_water, args.opt_grid_res)
+    initial_loss = cross_view_variance([0, 0, 0], *loss_args)
+    if not np.isfinite(initial_loss):
+        print("No grid cell is seen from two views, keeping the RANSAC plane")
+        return normal, d, {"optimized": False}
     result = minimize(
-        _opt_loss,
+        cross_view_variance,
         x0=[0.0, 0.0, 0.0],
-        args=(opt_data, base_normal, base_d, n_water, grid_res),
+        args=loss_args,
         method="Nelder-Mead",
         options={"maxiter": 300, "xatol": 1e-6, "fatol": 1e-10},
     )
-
     dh, dtx, dty = result.x
-    cx, sx = np.cos(dtx), np.sin(dtx)
-    cy, sy = np.cos(dty), np.sin(dty)
-    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-    opt_normal = Ry @ Rx @ base_normal
-    opt_normal /= np.linalg.norm(opt_normal)
-    opt_d = base_d - dh
-
-    improv = (1 - result.fun / max(loss0, 1e-15)) * 100
     print(
-        f"    Optimised: dh={dh:.6f},  "
-        f"dtx={np.degrees(dtx):.4f} deg,  dty={np.degrees(dty):.4f} deg"
+        f"  plane raised by {dh:+.6f}, tilted {np.degrees(dtx):+.4f} deg about x and "
+        f"{np.degrees(dty):+.4f} deg about y; variance "
+        f"{initial_loss:.3e} -> {result.fun:.3e}"
     )
-    print(
-        f"    Final variance: {result.fun:.8f}  "
-        f"(was {loss0:.8f},  improvement {improv:.1f}%)"
-    )
-    return opt_normal, opt_d, result
+    stats = {
+        "optimized": True,
+        "opt_dh": float(dh),
+        "opt_dtx_deg": float(np.degrees(dtx)),
+        "opt_dty_deg": float(np.degrees(dty)),
+        "opt_final_loss": float(result.fun),
+    }
+    return (*tilted_plane(normal, d, result.x), stats)
 
-def setup_output_dir(output_dir, vggt_dir, view_indices):
-    output_dir = Path(output_dir)
-    vggt_dir = Path(vggt_dir)
+
+def new_file(path):
+    """path, unlinked first so that writing it never follows a link into the input."""
+    path.unlink(missing_ok=True)
+    return path
+
+
+def save_world_points(output_dir, view, points):
+    np.save(new_file(output_dir / f"world_points_{view['index']:03d}.npy"), points)
+
+
+def print_view(i, n_views, view, stats):
+    if i < 5 or i == n_views - 1:
+        line = (
+            f"  View {view['index']}: corrected {stats['n_corrected']:,} of "
+            f"{stats['n_water']:,} water px"
+        )
+        if "mean_incidence_deg" in stats:
+            line += f", mean incidence {stats['mean_incidence_deg']:.1f} deg"
+        print(line)
+    elif i == 5:
+        print("  ...")
+
+
+def correct_single_view(views, output_dir, camera_positions, args):
+    planes = []
+    for view in views:
+        shore = shoreline_points(view, args.shoreline_buffer)
+        if len(shore) < MIN_SHORELINE_POINTS:
+            print(f"  View {view['index']}: {len(shore)} shoreline points, uncorrected")
+            planes.append(None)
+            continue
+        normal, d, _, _, _ = fit_plane_ransac(
+            shore, args.ransac_iterations, args.ransac_threshold
+        )
+        planes.append(orient_toward_cameras(normal, d, camera_positions))
+
+    view_stats = []
+    for i, (view, plane) in enumerate(zip(views, planes)):
+        if plane is None:
+            n_water_px = len(water_pixels(view)[0])
+            save_world_points(output_dir, view, view["world_points"])
+            view_stats.append(
+                {
+                    "n_water": n_water_px,
+                    "n_corrected": 0,
+                    "n_skipped": n_water_px,
+                    "skipped_reason": "too few shoreline pts",
+                }
+            )
+            continue
+        normal, d = plane
+        corrected, stats = snell_correct(view, normal, d, args.n_water)
+        save_world_points(output_dir, view, corrected)
+        stats["plane_normal"] = normal.tolist()
+        stats["plane_d"] = float(d)
+        view_stats.append(stats)
+        print_view(i, len(views), view, stats)
+    # each view's plane is in its stats, so the metadata has no single plane
+    return None, None, {"method": "single_view_ransac"}, view_stats
+
+
+def correct_shared_plane(views, output_dir, camera_positions, args):
+    shore = np.concatenate([shoreline_points(v, args.shoreline_buffer) for v in views])
+    if len(shore) < 3:
+        print(f"ERROR: {len(shore)} shoreline points, the plane fit needs 3")
+        sys.exit(1)
+    normal, d, n_inliers, res_std, threshold = fit_plane_ransac(
+        shore, args.ransac_iterations, args.ransac_threshold
+    )
+    normal, d = orient_toward_cameras(normal, d, camera_positions)
+    print(
+        f"Plane: {n_inliers:,} of {len(shore):,} shoreline points are inliers, "
+        f"residual std {res_std:.6f}"
+    )
+    plane_stats = {
+        "method": f"{args.mode}_ransac",
+        "n_shoreline_total": len(shore),
+        "n_inliers": n_inliers,
+        "residual_std": res_std,
+        "inlier_threshold": float(threshold),
+    }
+    if args.mode == "optimized":
+        normal, d, opt_stats = optimize_plane(views, normal, d, args)
+        plane_stats.update(opt_stats)
+
+    view_stats = []
+    for i, view in enumerate(views):
+        corrected, stats = snell_correct(view, normal, d, args.n_water)
+        save_world_points(output_dir, view, corrected)
+        view_stats.append(stats)
+        print_view(i, len(views), view, stats)
+    return normal, d, plane_stats, view_stats
+
+
+def setup_output_dir(output_dir, vggt_dir, indices):
+    """Create output_dir with links to the unchanged per-view files of vggt_dir."""
     # 02 would read the views of an earlier, larger run along with this one
     stale = sorted(
         f.name
         for ext in ("npy", "png")
         for f in output_dir.glob(f"*_[0-9][0-9][0-9].{ext}")
-        if int(f.stem[-3:]) not in view_indices
+        if int(f.stem[-3:]) not in indices
     )
     if stale:
-        raise ValueError(
-            f"{output_dir} holds views of an earlier run ({stale[0]}), use a new folder"
+        print(
+            f"ERROR: {output_dir} holds views of an earlier run ({stale[0]}), "
+            "use a new folder"
         )
+        sys.exit(1)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    patterns = [
-        "depth_{idx:03d}.npy",
-        "depth_conf_{idx:03d}.npy",
-        "extrinsic_{idx:03d}.npy",
-        "intrinsic_{idx:03d}.npy",
-        "rgb_{idx:03d}.png",
-        "world_points_conf_{idx:03d}.npy",
-    ]
-    n_linked = 0
-    for idx in view_indices:
-        for pat in patterns:
-            fname = pat.format(idx=idx)
-            src = vggt_dir / fname
-            dst = output_dir / fname
+    for idx in indices:
+        for pattern in LINKED_FILES:
+            name = pattern.format(idx)
+            src = vggt_dir / name
             # a link or copy left by an earlier run may belong to another input
-            dst.unlink(missing_ok=True)
+            dst = new_file(output_dir / name)
             if src.exists():
-                os.symlink(src.resolve(), dst)
-                n_linked += 1
-    print(f"  Symlinked {n_linked} unchanged files to {output_dir}")
+                dst.symlink_to(src.resolve())
 
 
-def save_metadata(output_dir, args, plane_normal, plane_d, plane_stats, per_view_stats):
-    output_dir = Path(output_dir)
-    refr_meta = {
+def read_vggt_metadata(vggt_dir):
+    if not (vggt_dir / "metadata.json").exists():
+        return {}
+    with open(vggt_dir / "metadata.json") as f:
+        return json.load(f)
+
+
+def save_metadata(output_dir, args, normal, d, plane_stats, view_stats):
+    refraction_metadata = {
         "correction_script": "04_correct_refraction.py",
         "mode": args.mode,
         "n_water": args.n_water,
@@ -515,255 +576,70 @@ def save_metadata(output_dir, args, plane_normal, plane_d, plane_stats, per_view
         "opt_subsample_views": args.opt_subsample_views,
         "opt_subsample_pixels": args.opt_subsample_pixels,
         "opt_grid_res": args.opt_grid_res,
-        "source_vggt_dir": str(args.vggt_dir),
-        "mask_dir": str(args.mask_dir),
-        # single_view stores each view's plane in its stats instead
-        "plane_normal": None if plane_normal is None else plane_normal.tolist(),
-        "plane_d": None if plane_d is None else float(plane_d),
+        "source_vggt_dir": args.vggt_dir,
+        "mask_dir": args.mask_dir,
+        "plane_normal": None if normal is None else normal.tolist(),
+        "plane_d": None if d is None else float(d),
         "plane_stats": plane_stats,
-        "per_view_stats": per_view_stats,
+        "per_view_stats": view_stats,
     }
-    # unlink first, so that a link in place of an output is not written through
-    (output_dir / "refraction_metadata.json").unlink(missing_ok=True)
-    with open(output_dir / "refraction_metadata.json", "w") as f:
-        json.dump(refr_meta, f, indent=2)
+    with open(new_file(output_dir / "refraction_metadata.json"), "w") as f:
+        json.dump(refraction_metadata, f, indent=2)
 
-    orig_path = Path(args.vggt_dir) / "metadata.json"
-    if orig_path.exists():
-        with open(orig_path) as f:
-            meta = json.load(f)
-    else:
-        meta = {}
-    meta["refraction_corrected"] = True
-    meta["refraction_mode"] = args.mode
-    meta["refraction_n_water"] = args.n_water
-    (output_dir / "metadata.json").unlink(missing_ok=True)
-    with open(output_dir / "metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
+    # VGGT's own metadata, marked as corrected
+    vggt_metadata = read_vggt_metadata(Path(args.vggt_dir))
+    vggt_metadata["refraction_corrected"] = True
+    vggt_metadata["refraction_mode"] = args.mode
+    vggt_metadata["refraction_n_water"] = args.n_water
+    with open(new_file(output_dir / "metadata.json"), "w") as f:
+        json.dump(vggt_metadata, f, indent=2)
 
 
 def main():
     args = parse_args()
     t0 = time.time()
-    vggt_dir = Path(args.vggt_dir)
-
-    print("=" * 70)
-    print(f"REFRACTION CORRECTION  (mode={args.mode}, n_water={args.n_water})")
-    print("=" * 70)
-
-    output_dir = Path(args.output_dir)
+    vggt_dir, output_dir = Path(args.vggt_dir), Path(args.output_dir)
+    print(f"Refraction correction ({args.mode}, n_water {args.n_water})")
     if (
         vggt_dir.is_dir()
         and output_dir.is_dir()
         and os.path.samefile(output_dir, vggt_dir)
     ):
-        raise ValueError("--output_dir must differ from --vggt_dir")
-    meta_path = vggt_dir / "metadata.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            if json.load(f).get("refraction_corrected"):
-                raise ValueError(f"{vggt_dir} is already refraction-corrected")
+        print("ERROR: --output_dir must differ from --vggt_dir")
+        sys.exit(1)
+    if read_vggt_metadata(vggt_dir).get("refraction_corrected"):
+        print(f"ERROR: {vggt_dir} is already refraction-corrected")
+        sys.exit(1)
 
-    view_indices = [v["index"] for v in discover_vggt_views(vggt_dir)]
-    n_views = len(view_indices)
-    if n_views == 0:
-        raise FileNotFoundError(f"No world_points_NNN.npy files in {vggt_dir}")
-    print(f"\nFound {n_views} views in {vggt_dir}")
+    indices = [v["index"] for v in discover_vggt_views(vggt_dir)]
+    if not indices:
+        print(f"ERROR: No world_points_NNN.npy files in {vggt_dir}")
+        sys.exit(1)
+    views = load_views(vggt_dir, indices)
+    H, W = views[0]["world_points"].shape[:2]
+    print(f"VGGT: {len(views)} view(s) at {W} x {H} px in {vggt_dir}")
+    masks = load_masks(args.mask_dir, len(views), H, W, args.mask_threshold)
+    for view, mask in zip(views, masks):
+        view["water_mask"] = mask
+    camera_positions = np.array([v["C"] for v in views])
 
-    H, W = np.load(vggt_dir / f"world_points_{view_indices[0]:03d}.npy").shape[:2]
-    print(f"Resolution: {W} x {H}")
-
-    masks = load_all_masks(args.mask_dir, n_views, H, W, args.mask_threshold)
-
-    print("  Loading per-view data...")
-    views_data = []
-    camera_positions = []
-    for i, idx in enumerate(view_indices):
-        C = camera_centre(np.load(vggt_dir / f"extrinsic_{idx:03d}.npy"))
-        camera_positions.append(C)
-        views_data.append(
-            {
-                "index": idx,
-                "world_points": np.load(vggt_dir / f"world_points_{idx:03d}.npy"),
-                "water_mask": masks[i],
-                "C": C,
-            }
-        )
-    camera_positions = np.array(camera_positions)
-    print(f"  Camera span: {np.ptp(camera_positions, axis=0)}")
-
-    setup_output_dir(args.output_dir, args.vggt_dir, view_indices)
-
+    setup_output_dir(output_dir, vggt_dir, indices)
     if args.mode == "single_view":
-        print(f"\n--- Single-view mode: per-view surface estimation ---")
-        per_view_planes = []
-        all_stats = []
-
-        for i, vd in enumerate(views_data):
-            shore_pts, _ = extract_shoreline_points(
-                vd["world_points"], vd["water_mask"], args.shoreline_buffer
-            )
-
-            if len(shore_pts) < 20:
-                print(
-                    f"  View {vd['index']}: only {len(shore_pts)} shoreline "
-                    f"pts -- skipping correction"
-                )
-                per_view_planes.append(None)
-                n_water = int(
-                    (vd["water_mask"] & np.isfinite(vd["world_points"]).all(axis=2)).sum()
-                )
-                all_stats.append(
-                    {
-                        "n_water": n_water,
-                        "n_corrected": 0,
-                        "n_skipped": n_water,
-                        "skipped_reason": "too few shoreline pts",
-                    }
-                )
-                continue
-
-            normal, d_p, inlier_mask, res_std, _ = fit_plane_ransac(
-                shore_pts, args.ransac_iterations, args.ransac_threshold
-            )
-            normal, d_p = orient_normal_toward_cameras(normal, d_p, camera_positions)
-            per_view_planes.append((normal, d_p))
-            all_stats.append(None)  # filled in by the correction below
-
-            n_inl = int(inlier_mask.sum())
-            if i < 5 or i == n_views - 1:
-                print(
-                    f"  View {vd['index']}: {len(shore_pts)} shore pts, "
-                    f"{n_inl} inliers, res_std={res_std:.6f}"
-                )
-
-        for i, vd in enumerate(views_data):
-            out_path = Path(args.output_dir) / f"world_points_{vd['index']:03d}.npy"
-            out_path.unlink(missing_ok=True)
-            if per_view_planes[i] is None:
-                np.save(out_path, vd["world_points"])
-                continue
-            normal, d_p = per_view_planes[i]
-            corrected, stats = snell_correct_view(
-                vd["world_points"],
-                vd["water_mask"],
-                vd["C"],
-                normal,
-                d_p,
-                args.n_water,
-            )
-            np.save(out_path, corrected)
-            stats["plane_normal"] = normal.tolist()
-            stats["plane_d"] = float(d_p)
-            all_stats[i] = stats
-            if i < 5 or i == n_views - 1:
-                print(
-                    f"  View {vd['index']}: corrected "
-                    f"{stats['n_corrected']}/{stats['n_water']} water px"
-                )
-
-        save_metadata(
-            args.output_dir,
-            args,
-            None,
-            None,
-            {"method": "single_view_ransac"},
-            all_stats,
+        normal, d, plane_stats, view_stats = correct_single_view(
+            views, output_dir, camera_positions, args
         )
-
     else:
-        print(f"\n--- Collecting shoreline points from all {n_views} views ---")
-        all_shore = []
-        for i, vd in enumerate(views_data):
-            pts, _ = extract_shoreline_points(
-                vd["world_points"], vd["water_mask"], args.shoreline_buffer
-            )
-            all_shore.append(pts)
-            if i < 3 or i == n_views - 1:
-                print(f"  View {vd['index']}: {len(pts):,} shoreline points")
-
-        all_shore = np.concatenate(all_shore, axis=0)
-        print(f"  Total shoreline points: {len(all_shore):,}")
-
-        normal, d_plane, inlier_mask, res_std, threshold = fit_plane_ransac(
-            all_shore, args.ransac_iterations, args.ransac_threshold
+        normal, d, plane_stats, view_stats = correct_shared_plane(
+            views, output_dir, camera_positions, args
         )
-        normal, d_plane = orient_normal_toward_cameras(
-            normal, d_plane, camera_positions
-        )
-        n_inl = int(inlier_mask.sum())
-        print(
-            f"  RANSAC plane: {n_inl}/{len(all_shore)} inliers "
-            f"({100 * n_inl / len(all_shore):.1f}%)"
-        )
-        print(f"  Normal: [{normal[0]:.6f}, {normal[1]:.6f}, {normal[2]:.6f}]")
-        print(f"  d = {d_plane:.6f}")
-        print(f"  Residual std: {res_std:.6f}")
+    save_metadata(output_dir, args, normal, d, plane_stats, view_stats)
 
-        plane_stats = {
-            "method": f"{'optimized' if args.mode == 'optimized' else 'multi_view'}_ransac",
-            "n_shoreline_total": len(all_shore),
-            "n_inliers": n_inl,
-            "residual_std": float(res_std),
-            "inlier_threshold": float(threshold),
-        }
-
-        if args.mode == "optimized":
-            normal, d_plane, opt_result = optimize_water_surface(
-                views_data,
-                normal,
-                d_plane,
-                args.n_water,
-                args.opt_subsample_views,
-                args.opt_subsample_pixels,
-                args.opt_grid_res,
-            )
-            plane_stats["optimized"] = opt_result is not None
-            if opt_result is not None:
-                plane_stats["opt_dh"] = float(opt_result.x[0])
-                plane_stats["opt_dtx_deg"] = float(np.degrees(opt_result.x[1]))
-                plane_stats["opt_dty_deg"] = float(np.degrees(opt_result.x[2]))
-                plane_stats["opt_final_loss"] = float(opt_result.fun)
-
-        print(f"\n--- Applying Snell's law correction (n_water={args.n_water}) ---")
-        all_stats = []
-        for i, vd in enumerate(views_data):
-            corrected, stats = snell_correct_view(
-                vd["world_points"],
-                vd["water_mask"],
-                vd["C"],
-                normal,
-                d_plane,
-                args.n_water,
-            )
-            out_path = Path(args.output_dir) / f"world_points_{vd['index']:03d}.npy"
-            out_path.unlink(missing_ok=True)
-            np.save(out_path, corrected)
-            all_stats.append(stats)
-            if i < 5 or i == n_views - 1:
-                print(
-                    f"  View {vd['index']}: "
-                    f"{stats['n_corrected']}/{stats['n_water']} corrected  "
-                    f"angle={stats.get('mean_incidence_deg', 0):.1f} deg"
-                )
-            elif i == 5:
-                print(f"  ... (showing first 5 and last)")
-
-        save_metadata(args.output_dir, args, normal, d_plane, plane_stats, all_stats)
-
-    elapsed = time.time() - t0
-    total_water = sum(s.get("n_water", 0) for s in all_stats)
-    total_corr = sum(s.get("n_corrected", 0) for s in all_stats)
-
-    print(f"\n{'=' * 70}")
-    print("REFRACTION CORRECTION COMPLETE")
-    print(f"{'=' * 70}")
-    print(f"  Output directory: {args.output_dir}")
-    print(f"  Mode: {args.mode}")
-    print(f"  Refractive index: {args.n_water}")
-    print(f"  Total water pixels: {total_water:,}")
-    print(f"  Total corrected:    {total_corr:,}")
-    print(f"  Elapsed: {elapsed:.1f}s")
+    n_water_px = sum(s["n_water"] for s in view_stats)
+    n_corrected = sum(s["n_corrected"] for s in view_stats)
+    print(
+        f"Corrected {n_corrected:,} of {n_water_px:,} water pixels in "
+        f"{time.time() - t0:.1f} s, outputs in {output_dir}"
+    )
 
 
 if __name__ == "__main__":
