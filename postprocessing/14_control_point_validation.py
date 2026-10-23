@@ -46,9 +46,8 @@ import matplotlib.pyplot as plt
 
 from coord_utils import sample_wsm_batch
 
-PLY_VERTEX = np.dtype(
-    [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")]
-)
+# PLY property types of 07's point clouds -> numpy
+PLY_TYPES = {"float": "<f4", "double": "<f8", "uchar": "u1"}
 PLY_CHUNK_POINTS = 5_000_000
 BACKGROUND_POINTS = 50_000
 UNDERWATER_TYPES = ["reference_target", "transect"]
@@ -127,7 +126,7 @@ def parse_args():
 
 
 def natural_key(name):
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(name))]
+    return [int(t) if t.isdecimal() else t for t in re.split(r"(\d+)", str(name))]
 
 
 def sort_by_name(df):
@@ -434,6 +433,19 @@ def plot_analysis(matched, scale_factor, label, path):
     save_figure(path)
 
 
+def along_transect(rows):
+    """The rows of a transect run in their order along its main direction.
+
+    The survey order can jump back: QP15_7 lies between QP15_4 and QP15_5.
+    """
+    xy = rows[["gt_easting", "gt_northing"]].to_numpy(dtype=np.float64)
+    xy -= xy.mean(axis=0)
+    position = xy @ np.linalg.svd(xy, full_matrices=False)[2][0]
+    if position[-1] < position[0]:
+        position = -position
+    return rows.iloc[np.argsort(position, kind="stable")]
+
+
 def transect_panels(matched):
     """(title, rows) of each transect, in natural order of the names.
 
@@ -447,7 +459,7 @@ def transect_panels(matched):
         runs = rows.loc[rows["transect"] == name, "run"].unique()
         for k, run in enumerate(runs, 1):
             title = name if len(runs) == 1 else f"{name} ({k}/{len(runs)})"
-            panels.append((title, rows[rows["run"] == run]))
+            panels.append((title, along_transect(rows[rows["run"] == run])))
     return panels
 
 
@@ -702,18 +714,36 @@ def plot_spatial_errors(matched, background, label, path):
 
 
 def read_ply_header(path):
-    """Number of vertices and header size of a PLY from 07_make_pointcloud.py."""
+    """Header bytes, number of vertices and vertex dtype of a PLY from
+    07_make_pointcloud.py: binary little-endian, one vertex element with x, y and z
+    (float32, or float64 easting/northing)."""
     n_vertices = None
+    fields = []
     with open(path, "rb") as f:
         while True:
             raw_line = f.readline()
             if not raw_line:
                 raise ValueError(f"No end_header in {path}")
             line = raw_line.decode("ascii", errors="replace").strip()
-            if n_vertices is None and line.startswith("element vertex"):
-                n_vertices = int(line.split()[-1])
+            words = line.split()
+            if words[:1] == ["format"] and words[1:2] != ["binary_little_endian"]:
+                raise ValueError(f"{path} is not a binary little-endian PLY")
+            if words[:1] == ["element"]:
+                if n_vertices is not None or words[1:2] != ["vertex"]:
+                    raise ValueError(f"{path} has other elements than one vertex list")
+                n_vertices = int(words[-1])
+            elif words[:1] == ["property"] and n_vertices is not None:
+                if len(words) != 3 or words[1] not in PLY_TYPES:
+                    raise ValueError(f"Unsupported PLY property in {path}: {line}")
+                fields.append((words[2], PLY_TYPES[words[1]]))
             if line == "end_header":
-                return n_vertices, f.tell()
+                header_bytes = f.tell()
+                break
+        f.seek(0)
+        header = f.read(header_bytes)
+    if not {"x", "y", "z"} <= {name for name, _ in fields}:
+        raise ValueError(f"{path} has no x, y and z vertex properties")
+    return header, n_vertices, np.dtype(fields)
 
 
 def water_surface(wsm_path, fitted_json):
@@ -751,38 +781,25 @@ def water_surface(wsm_path, fitted_json):
 def write_scaled_ply(src_path, out_path, scale_factor, wsm_path, fitted_json):
     """Write the source PLY with the depth of every point below the water surface
     multiplied by scale_factor."""
-    n_vertices, header_bytes = read_ply_header(src_path)
+    header, n_vertices, vertex = read_ply_header(src_path)
     if n_vertices is None or n_vertices < 0:
         raise ValueError(f"No valid vertex count in the header of {src_path}")
     water_level = water_surface(wsm_path, fitted_json)
-
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        f"element vertex {n_vertices}\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        "property uchar red\n"
-        "property uchar green\n"
-        "property uchar blue\n"
-        "end_header\n"
-    )
     # written to a .part file first, so that a broken source leaves no partial PLY
     part_path = out_path + ".part"
     n_scaled = 0
     try:
         with open(src_path, "rb") as src, open(part_path, "wb") as out:
-            src.seek(header_bytes)
-            out.write(header.encode("ascii"))
+            src.seek(len(header))
+            out.write(header)
             for start in range(0, n_vertices, PLY_CHUNK_POINTS):
                 n = min(PLY_CHUNK_POINTS, n_vertices - start)
-                raw = src.read(n * PLY_VERTEX.itemsize)
-                if len(raw) < n * PLY_VERTEX.itemsize:
+                raw = src.read(n * vertex.itemsize)
+                if len(raw) < n * vertex.itemsize:
                     raise OSError(
                         f"{src_path} ends at vertex {start:,} of {n_vertices:,}"
                     )
-                verts = np.frombuffer(raw, dtype=PLY_VERTEX)
+                verts = np.frombuffer(raw, dtype=vertex).copy()
                 easting = verts["x"].astype(np.float64)
                 northing = verts["y"].astype(np.float64)
                 elevation = verts["z"].astype(np.float64)
@@ -795,13 +812,9 @@ def write_scaled_ply(src_path, out_path, scale_factor, wsm_path, fitted_json):
                     scaled_elev[underwater] = ws_elev[underwater] - depth * scale_factor
                     n_scaled += int(np.sum(underwater))
 
-                out_verts = np.empty(n, dtype=PLY_VERTEX)
-                out_verts["x"] = easting.astype(np.float32)
-                out_verts["y"] = northing.astype(np.float32)
-                out_verts["z"] = scaled_elev.astype(np.float32)
-                for c in "rgb":
-                    out_verts[c] = verts[c]
-                out.write(out_verts.tobytes())
+                # the layout of the source; only the elevation changes
+                verts["z"] = scaled_elev
+                out.write(verts.tobytes())
         os.replace(part_path, out_path)
     finally:
         if os.path.exists(part_path):
