@@ -176,8 +176,9 @@ def parse_args():
     parser.add_argument(
         "--wsm_path",
         type=str,
-        required=True,
-        help="water surface model GeoTIFF",
+        default="",
+        help="water surface model GeoTIFF; required except for --mode nerfrac with "
+        "--depth_method plane_fit",
     )
     parser.add_argument(
         "--mask_dir",
@@ -225,7 +226,14 @@ def parse_args():
         help="also write depth maps to <csv stem>_views/, every 10th view when "
         "there are more than 20",
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    if not args.wsm_path:
+        if args.mode == "vggt":
+            parser.error("--mode vggt needs --wsm_path")
+        if args.depth_method == "wsm":
+            parser.error("--depth_method wsm (the default) needs --wsm_path")
+    return args
 
 
 def list_masks(mask_dir, n_views):
@@ -737,7 +745,8 @@ def main():
     umeyama = load_umeyama(args.umeyama_npz)
     s, R, t = umeyama["scale"], umeyama["rotation"], umeyama["translation"]
     print(
-        f"Umeyama scale {s:.6f}, XY RMS {umeyama.get('xy_rms', float('nan')):.3f} m, "
+        f"Umeyama scale {s:.6f}, "
+        f"horizontal RMS {umeyama.get('xy_rms', float('nan')):.3f} m, "
         f"Z correction {umeyama.get('z_correction', 0.0):+.4f} m"
     )
 
