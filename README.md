@@ -21,7 +21,9 @@ RGB drone images with two methods:
 
 On the Pielach River in Austria, the best NeRFrac model reaches an RMSE of 0.34 m on 138
 survey points up to 1.2 m deep, measured below the surveyed water surface. VGGT reaches
-0.27 m on the 8 underwater reference targets.
+0.27 m on the 8 underwater reference targets. The
+[project page](https://konradjkl.github.io/NeuroBathy/) shows the best model's point cloud
+in 3D, with the survey points and the depth below the water surface.
 
 ```mermaid
 flowchart TD
