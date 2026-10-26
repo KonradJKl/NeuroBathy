@@ -5,7 +5,7 @@ corrected for refraction, georeferenced and validated against surveyed ground tr
 
 This is the code of my MSc thesis *Physics-Informed Neural 3D Scene Reconstruction in
 Ocean Remote Sensing* (Computer Science, TU Berlin, Remote Sensing Image Analysis Group,
-2026), graded 1.0 (the top grade on the German scale).
+2026).
 
 Light bends where it enters the water, so a riverbed seen from the air looks about 25%
 shallower than it is. I built an end-to-end pipeline that recovers the true depth from
