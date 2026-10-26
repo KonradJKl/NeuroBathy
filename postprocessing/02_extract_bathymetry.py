@@ -15,14 +15,14 @@ Usage examples:
         --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
         --output_csv bathymetry/bathymetry_nerfrac_50m.csv
 
-    # VGGT 50m
+    # VGGT nadir
     python 02_extract_bathymetry.py \\
         --mode vggt \\
-        --vggt_dir /path/to/vggt_output \\
-        --umeyama_npz ../data/transforms/vggt_50m_v1_umeyama.npz \\
-        --mask_dir /path/to/pielach_50m/masks_8 \\
+        --vggt_dir /path/to/vggt_nadir \\
+        --umeyama_npz ../data/transforms/vggt_nadir_umeyama.npz \\
+        --mask_dir /path/to/pielach_data/masks \\
         --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
-        --output_csv bathymetry/bathymetry_vggt_50m.csv
+        --output_csv bathymetry/bathymetry_vggt_nadir.csv
 """
 
 import argparse

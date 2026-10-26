@@ -19,21 +19,21 @@ per-view files, metadata.json and refraction_metadata.json, so that
 02_extract_bathymetry.py reads it like any VGGT folder.
 
 Usage example:
-    # VGGT nadir, one plane for all views
+    # VGGT nadir, one plane per view
     python 04_correct_refraction.py \\
         --vggt_dir /path/to/vggt_nadir \\
         --mask_dir /path/to/pielach_data/masks \\
-        --mode multi_view \\
-        --output_dir refraction/vggt_nadir_multi_view
+        --mode single_view \\
+        --output_dir refraction/vggt_nadir_single_view
 
     # then the bathymetry of the corrected folder
     python 02_extract_bathymetry.py \\
         --mode vggt \\
-        --vggt_dir refraction/vggt_nadir_multi_view \\
+        --vggt_dir refraction/vggt_nadir_single_view \\
         --umeyama_npz ../data/transforms/vggt_nadir_umeyama.npz \\
         --mask_dir /path/to/pielach_data/masks \\
         --wsm_path ../data/gt/pielach/05_water_surface_model/Pielach_20241024_WSM.tif \\
-        --output_csv bathymetry/bathymetry_vggt_nadir_snell_mv.csv
+        --output_csv bathymetry/bathymetry_vggt_nadir_snell_sv.csv
 """
 
 import argparse

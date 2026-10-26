@@ -3,16 +3,16 @@ Run VGGT on a folder of images and save per-view depth, point maps, confidences
 and predicted cameras for the postprocessing pipeline (01, 02, 04, 07).
 
 Usage examples:
-    # Depth unprojection (default)
+    # Depth unprojection (default), 9 nadir images
     python models/vggt/run_vggt_inference.py \\
-        --image_dir /path/to/pielach_oblique/images \\
-        --output_dir /path/to/vggt_obq
+        --image_dir /path/to/pielach_data/images \\
+        --output_dir /path/to/vggt_nadir
 
     # Point-map head, with separate water and land point clouds
     python models/vggt/run_vggt_inference.py \\
-        --image_dir /path/to/pielach_oblique/images \\
-        --output_dir /path/to/vggt_obq_pointmap \\
-        --mask_dir /path/to/pielach_oblique/masks \\
+        --image_dir /path/to/pielach_data/images \\
+        --output_dir /path/to/vggt_nadir_pointmap \\
+        --mask_dir /path/to/pielach_data/masks \\
         --use_point_map
 
 Per-view outputs (NNN = index in sorted filename order):
