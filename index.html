@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeuroBathy</title>
+  <meta name="description" content="Shallow-water bathymetry from drone images with two neural 3D reconstruction methods, corrected for refraction, georeferenced and validated against surveyed ground truth.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="NeuroBathy">
+  <meta property="og:description" content="Shallow-water bathymetry from drone images with two neural 3D reconstruction methods, corrected for refraction, georeferenced and validated against surveyed ground truth.">
+  <meta property="og:url" content="https://konradjkl.github.io/NeuroBathy/">
+  <meta property="og:image" content="https://konradjkl.github.io/NeuroBathy/figures/depth_map.png">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2321918c'/%3E%3Cpath d='M6 13c3.3-3 6.7 3 10 0s6.7 3 10 0M6 20c3.3-3 6.7 3 10 0s6.7 3 10 0' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="assets/viewer.js" onerror="viewerFailed()"></script>
+  <script>
+    function viewerFailed() {
+      const message = document.getElementById('viewer-message');
+      message.textContent = 'Could not load the 3D viewer.';
+      message.hidden = false;
+      document.getElementById('viewer-controls').hidden = true;
+    }
+  </script>
+</head>
+<body>
+  <header class="hero">
+    <h1>NeuroBathy</h1>
+    <p class="subtitle">Shallow-water bathymetry from drone images with two neural 3D reconstruction methods, corrected for refraction, georeferenced and validated against surveyed ground truth.</p>
+    <p class="author"><a href="https://github.com/KonradJKl">Konrad Kloska</a></p>
+    <p class="affiliation">MSc thesis <em>Physics-Informed Neural 3D Scene Reconstruction in Ocean Remote Sensing</em><br>Remote Sensing Image Analysis Group, TU Berlin, 2026</p>
+    <nav class="links" aria-label="Links">
+      <a class="pill" href="https://github.com/KonradJKl/NeuroBathy">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8.5 7 3.5 12l5 5M15.5 7l5 5-5 5M13.5 4.5l-3 15"/></svg>
+        Code
+      </a>
+      <a class="pill" href="https://doi.org/10.48436/taz19-r6618">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><ellipse cx="12" cy="5.5" rx="7.5" ry="2.75"/><path d="M4.5 5.5v13c0 1.52 3.36 2.75 7.5 2.75s7.5-1.23 7.5-2.75v-13M4.5 12c0 1.52 3.36 2.75 7.5 2.75s7.5-1.23 7.5-2.75"/></svg>
+        Data
+      </a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="teaser" aria-label="3D view">
+      <div class="viewer wide">
+        <div class="viewer-stage" id="viewer-stage">
+          <p class="viewer-status" id="viewer-status" role="status" hidden></p>
+          <p class="viewer-hint" id="viewer-hint" hidden></p>
+          <div class="viewer-legend" id="viewer-legend" hidden></div>
+          <p class="viewer-attribution" id="viewer-attribution" hidden></p>
+          <div class="viewer-tooltip" id="viewer-tooltip" hidden></div>
+          <p class="viewer-message" id="viewer-message" hidden></p>
+          <noscript><p class="viewer-message">The 3D view needs JavaScript.</p></noscript>
+        </div>
+        <div class="viewer-controls" id="viewer-controls">
+          <div class="segmented" role="group" aria-label="Colouring">
+            <button type="button" data-colouring="rgb" aria-pressed="true">True colour</button>
+            <button type="button" data-colouring="depth" aria-pressed="false">Depth</button>
+          </div>
+          <button type="button" class="switch" id="viewer-survey" aria-pressed="true">Survey points</button>
+          <label class="slider">
+            <span>Depth exaggeration</span>
+            <input type="range" id="viewer-exaggeration" min="1" max="5" step="0.5" value="1" autocomplete="off">
+            <output id="viewer-exaggeration-value" for="viewer-exaggeration">1×</output>
+          </label>
+          <button type="button" class="reset" id="viewer-reset">Reset view</button>
+        </div>
+      </div>
+      <p class="caption wide">Point cloud of the best NeRFrac model (9 oblique images, distortion loss, 256 samples) with the 138 survey points. At 1× the view is true to scale, and the riverbed, at most about 2 m deep in a scene 250 m across, looks almost flat. The depth exaggeration stretches only the depth below the water surface, to make its shape visible.</p>
+    </section>
+
+    <section id="overview">
+      <h2>Overview</h2>
+      <p>Light bends where it enters the water, so a riverbed seen from the air looks about 25% shallower than it is. I built an end-to-end pipeline that recovers the true depth from RGB drone images with two methods:</p>
+      <ul>
+        <li><strong>NeRFrac</strong> (Zhan et al., ICCV 2023), a neural radiance field trained per scene that learns the water surface and refracts every ray through it with Snell's law. I extended it from a fixed 3 × 3 camera array above an aquarium to drone imagery, with up to 280 images per scene.</li>
+        <li><strong>VGGT</strong> (Wang et al., CVPR 2025), a pretrained transformer that predicts depth and camera poses in one forward pass. It does not model refraction, so I correct its depths with Snell's law afterwards.</li>
+      </ul>
+      <p>On the Pielach River in Austria, the best NeRFrac model reaches an RMSE of 0.34 m on 138 survey points up to 1.2 m deep, measured below the surveyed water surface. VGGT reaches 0.27 m on the 8 underwater reference targets.</p>
+    </section>
+
+    <section id="method">
+      <h2>Method</h2>
+      <p>Both methods share one postprocessing: depth below the water surface on a 0.1 m grid, validated against 8 underwater targets, 130 cross-section points and a bathymetric LiDAR point cloud.</p>
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart TD
+    images["Drone images"] --> poses["Camera poses (COLMAP)"]
+    images --> masks["Water masking (SAM 3)"]
+    images --> vggt["VGGT, one forward pass"]
+    poses --> nerfrac["Modified NeRFrac, trained per scene"]
+    masks --> nerfrac
+    masks --> snell["Refraction correction (Snell's law)"]
+    vggt --> snell
+    nerfrac --> geo["Georeferencing (Umeyama, UTM 33N)"]
+    snell --> geo
+    geo --> bathy["Bathymetry extraction (depth below the water surface)"]
+    bathy --> val["Validation (targets, cross-sections, LiDAR)"]
+        </pre>
+      </figure>
+      <p>My version of NeRFrac routes water and land rays separately, adds the distortion and cross-view depth consistency losses, and saves every rendered view with its depth.</p>
+      <figure class="figure-nerfrac">
+        <img src="figures/nerfrac_original_vs_modified.png" width="1162" height="1262" loading="lazy" alt="Original NeRFrac and my version with per-ray water/land routing">
+        <figcaption>Original NeRFrac (left) and my version (right). Water rays are refracted at the learned surface, land rays are rendered along straight lines, and both use the same coarse and fine radiance MLPs.</figcaption>
+      </figure>
+    </section>
+
+    <section id="results">
+      <h2>Results</h2>
+      <p>The Pielach River was flown in October 2024 at 80 m (Mandlburger et al., 2025). I used three image sets: 9 nadir images, 9 oblique images (6 with the camera pitched 45-50° below the horizon, 3 near-nadir), and all 280 images within 50 m of a centre point (100 nadir, 180 oblique).</p>
+      <p>Depth is measured below the surveyed water surface model (WSM), without scale correction. Targets are the 8 underwater reference targets (0.67-1.19 m deep). All adds 130 cross-section points, 138 points in total. LiDAR compares the underwater cells with the bathymetric LiDAR point cloud on a 0.1 m grid. RMSE is in metres, and <span class="nowrap">|ρ|</span> is the absolute Spearman rank correlation between predicted and surveyed depth.</p>
+      <div class="table-wrap wide">
+        <table>
+          <thead>
+            <tr>
+              <th rowspan="2">Method</th>
+              <th rowspan="2">Images</th>
+              <th rowspan="2">Setup</th>
+              <th class="group">Targets</th>
+              <th class="group" colspan="2">All</th>
+              <th class="group" colspan="2">LiDAR</th>
+            </tr>
+            <tr>
+              <th class="num">RMSE</th>
+              <th class="num">RMSE</th>
+              <th class="num">|ρ|</th>
+              <th class="num">RMSE</th>
+              <th class="num">|ρ|</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>NeRFrac</td><td>9 oblique</td><td>distortion loss, 256 samples</td>
+              <td class="num">0.54</td><td class="num"><strong>0.34</strong></td><td class="num"><strong>0.48</strong></td><td class="num"><strong>0.48</strong></td><td class="num">0.39</td>
+            </tr>
+            <tr>
+              <td>NeRFrac</td><td>9 oblique</td><td>distortion loss, 64 samples</td>
+              <td class="num">0.51</td><td class="num">0.46</td><td class="num">0.27</td><td class="num">0.49</td><td class="num">0.21</td>
+            </tr>
+            <tr>
+              <td>NeRFrac</td><td>9 oblique</td><td>64 samples</td>
+              <td class="num">0.44</td><td class="num">0.88</td><td class="num">0.10</td><td class="num">0.65</td><td class="num">0.24</td>
+            </tr>
+            <tr>
+              <td>NeRFrac</td><td>280 nadir and oblique</td><td>distortion loss, 256 samples</td>
+              <td class="num">0.40</td><td class="num">0.58</td><td class="num">0.34</td><td class="num">0.49</td><td class="num">0.41</td>
+            </tr>
+            <tr>
+              <td>NeRFrac</td><td>280 nadir and oblique</td><td>256 samples</td>
+              <td class="num">0.45</td><td class="num">1.09</td><td class="num">0.35</td><td class="num">1.04</td><td class="num"><strong>0.44</strong></td>
+            </tr>
+            <tr class="split">
+              <td>VGGT</td><td>9 nadir</td><td>no Snell correction</td>
+              <td class="num"><strong>0.27</strong></td><td class="num">0.59</td><td class="num">0.16</td><td class="num">0.57</td><td class="num">0.08</td>
+            </tr>
+            <tr>
+              <td>VGGT</td><td>9 nadir</td><td>single-view Snell correction</td>
+              <td class="num">0.29</td><td class="num">0.59</td><td class="num">0.22</td><td class="num">0.58</td><td class="num">0.11</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>NeRFrac on the 9 oblique images with distortion loss and 256 samples has the lowest error on all points (0.34 m) and against the LiDAR (0.48 m). VGGT without Snell correction has the lowest error on the 8 targets (0.27 m). The single-view Snell correction raises VGGT's <span class="nowrap">|ρ|</span> from 0.16 to 0.22 on all points and from 0.08 to 0.11 against the LiDAR.</p>
+      <p class="note">All NeRFrac models in the table are trained at 1024 × 683 px for 950k iterations with the water masks, the cross-view depth consistency loss and the smoothness term, in 9-76 h each on one A100 (80 GB). "256 samples" means 256 coarse and 256 fine samples per ray with 4096 rays per batch, "64 samples" means 64 + 64 with 512 rays. The depth is taken at the sample with the highest weight on each ray (mode depth). Predictions deeper than 5 m or above the WSM are discarded, which leaves the oblique model without distortion loss with predictions at 136 of the 138 points. VGGT runs on the 9 images at 518 × 350 px in under 14 s, and its predictions cover 116 of the 138 points.</p>
+      <figure class="figure-depth wide">
+        <a href="figures/depth_map.png"><img src="figures/depth_map.png" width="1800" height="1302" loading="lazy" alt="Map of the predicted depth along the river with the survey points coloured by their error"></a>
+        <figcaption>Depth below the WSM from the best NeRFrac model on the 0.1 m grid. The 130 cross-section points and the 8 underwater reference targets are coloured by predicted minus surveyed depth.</figcaption>
+      </figure>
+      <figure class="figure-lidar wide">
+        <a href="figures/lidar_comparison.png"><img src="figures/lidar_comparison.png" width="1800" height="2748" loading="lazy" alt="Maps of the predicted depth, the LiDAR depth and their difference"></a>
+        <figcaption>Depth from the best NeRFrac model (top), from the bathymetric LiDAR (middle) and their difference (bottom) on the underwater cells of the 0.1 m grid. The RMSE is 0.48 m.</figcaption>
+      </figure>
+    </section>
+
+    <section id="credits">
+      <h2>Credits and licenses</h2>
+      <ul class="credits">
+        <li><a href="https://github.com/Yifever20002/NeRFrac">NeRFrac</a> by Yifan Zhan, Shohei Nobuhara, Ko Nishino and Yinqiang Zheng (ICCV 2023). It builds on <a href="https://github.com/bmild/nerf">NeRF</a> and <a href="https://github.com/yenchenlin/nerf-pytorch">nerf-pytorch</a>. The repository contains a modified copy.</li>
+        <li><a href="https://github.com/facebookresearch/vggt">VGGT</a> (Wang et al., CVPR 2025, University of Oxford and Meta AI) and <a href="https://github.com/facebookresearch/sam3">SAM 3</a> (Carion et al., 2025, Meta) are installed separately and come with their own licenses.</li>
+        <li><a href="https://doi.org/10.48436/taz19-r6618">Pielach River research dataset October 2024</a> by G. Mandlburger, TU Wien, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>. It is described in <a href="https://doi.org/10.23784/HN130-06">Mandlburger et al. (2025)</a>. The point cloud, the survey points and the two maps on this page are derived from it (reconstructed, thinned, re-plotted) and are licensed CC BY 4.0.</li>
+        <li>The thesis was supervised by Prof. Dr. Begüm Demir and advised by Dr.-Ing. Panagiotis Agrafiotis.</li>
+        <li>The code is MIT licensed, see <a href="https://github.com/KonradJKl/NeuroBathy/blob/main/LICENSE">LICENSE</a>. Third-party code keeps its own license, see <a href="https://github.com/KonradJKl/NeuroBathy/blob/main/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>.</li>
+        <li>This page uses <a href="https://threejs.org/">three.js</a> and <a href="https://mermaid.js.org/">mermaid</a>, both MIT licensed and loaded from jsDelivr. Its own code is MIT licensed as well.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>Konrad Kloska, 2026 · <a href="https://github.com/KonradJKl/NeuroBathy">github.com/KonradJKl/NeuroBathy</a></p>
+  </footer>
+
+  <script type="module">
+    const diagram = document.querySelector('.mermaid');
+    try {
+      const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs');
+      mermaid.initialize({ startOnLoad: false, theme: 'neutral', fontFamily: getComputedStyle(document.body).fontFamily });
+      await mermaid.run({ nodes: [diagram] });
+    } catch {
+      diagram.classList.add('is-source');
+    }
+  </script>
+</body>
+</html>

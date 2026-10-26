@@ -1,0 +1,23 @@
+{
+  "crs": "EPSG:25833",
+  "origin": [
+    527570.6598535677,
+    5340203.832637745,
+    251.2736232933133
+  ],
+  "step": 0.004,
+  "levels": [
+    {
+      "file": "scene_0.bin",
+      "count": 382067
+    },
+    {
+      "file": "scene_1.bin",
+      "count": 1670108
+    }
+  ],
+  "depth_max": 2.0,
+  "survey": "survey_points.json",
+  "attribution": "Derived from the Pielach River research dataset October 2024 by G. Mandlburger, TU Wien, licensed CC BY 4.0, https://doi.org/10.48436/taz19-r6618",
+  "license": "CC BY 4.0"
+}
