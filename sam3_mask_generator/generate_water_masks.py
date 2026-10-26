@@ -4,8 +4,8 @@ Generate binary water masks with SAM3 text prompts.
 Usage examples:
     # Pielach (river)
     python sam3_mask_generator/generate_water_masks.py \\
-        --input_dir data/model_formatted/nerfrac/pielach_data/images_8 \\
-        --output_dir data/model_formatted/nerfrac/pielach_data/masks_8 \\
+        --input_dir data/model_formatted/nerfrac/pielach_oblique/images_4 \\
+        --output_dir data/model_formatted/nerfrac/pielach_oblique/masks_4 \\
         --scene river
 
     # Coastal scene with seagrass
@@ -58,14 +58,14 @@ def parse_args():
         "--input_dir",
         type=str,
         required=True,
-        help="Directory with the .jpg/.png images (e.g. pielach_data/images_8)",
+        help="Directory with the .jpg/.png images (e.g. pielach_oblique/images_4)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         required=True,
         help="Output directory for the full-size masks, saved as <image stem>.png "
-        "with 255 = water (e.g. pielach_data/masks_8)",
+        "with 255 = water (e.g. pielach_oblique/masks_4)",
     )
 
     # Segmentation
@@ -75,7 +75,7 @@ def parse_args():
         required=True,
         choices=sorted(PROMPTS),
         help="Prompt set from PROMPTS: 'river' (e.g. Pielach) or 'coastal' "
-        "(e.g. Santa Maria)",
+        "(sea and shallow coastal water)",
     )
     parser.add_argument(
         "--primary_conf",

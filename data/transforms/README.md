@@ -6,20 +6,22 @@ from the reconstructed camera centres and the GPS positions in the EXIF data of 
 Pielach images. `02_extract_bathymetry.py`, `07_make_pointcloud.py` and
 `08_water_surface_analysis.py` read them with `--umeyama_npz`.
 
-| File | Model frame | Cameras | Scale | Horizontal RMS (m) | Z RMS (m) |
+| File | Model frame | Cameras | Scale | Horizontal RMS (m) | Vertical RMS (m) |
 |---|---|---|---|---|---|
 | `nerfrac_nadir_umeyama.npz` | COLMAP, nadir | 9 | 6.007 | 0.23 | 0.32 |
 | `nerfrac_oblique_umeyama.npz` | COLMAP, oblique | 9 | 5.759 | 0.24 | 0.04 |
-| `nerfrac_50m_umeyama.npz` | COLMAP, 50 m | 280 | 10.071 | 0.14 | 0.06 |
+| `nerfrac_50m_umeyama.npz` | COLMAP, "50m" set | 280 | 10.071 | 0.14 | 0.06 |
 | `nerfrac_nadir_rotated_umeyama.npz` | COLMAP, nadir with 3 images rotated by 180° | 9 | 5.983 | 0.22 | 0.32 |
 | `nerfrac_perfect_v2_umeyama.npz` | COLMAP, 17-image "perfect" subset | 17 | 22.719 | 0.25 | 0.13 |
 | `vggt_nadir_umeyama.npz` | VGGT, nadir | 9 | 73.687 | 0.97 | 0.40 |
 | `vggt_oblique_umeyama.npz` | VGGT, oblique | 9 | 70.310 | 18.32 | 2.48 |
-| `vggt_50m_v1_umeyama.npz` | VGGT, 50 m | 280 | 76.553 | 22.13 | 5.67 |
+| `vggt_50m_v1_umeyama.npz` | VGGT, "50m" set | 280 | 76.553 | 22.13 | 5.67 |
 
-The RMS values are those of the horizontal and the vertical residuals of the camera
-fit. The large residuals of the VGGT oblique and 50 m transforms come from VGGT's camera
-estimates for these image sets.
+The RMS values are those of the horizontal and the vertical camera residuals. Each file
+also stores the RMS of the 3D residual (`total_rms`). The "50m" set holds the 280 nadir
+and oblique images taken within 50 m of a centre point over the WSM; all images were
+taken at an altitude of 80 m. The large residuals of the VGGT oblique and "50m"
+transforms come from VGGT's camera estimates for these image sets.
 
 Derived from the Pielach River dataset (G. Mandlburger, TU Wien, CC BY 4.0,
 https://doi.org/10.48436/taz19-r6618), see `data/gt/pielach/README.md`. These files are

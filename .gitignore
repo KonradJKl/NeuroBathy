@@ -1,6 +1,3 @@
-### Example user template template
-### Example user template
-
 # IntelliJ project files
 .idea
 *.iml
@@ -40,12 +37,8 @@ MANIFEST
 # ============================================
 
 # Data
-data/raw/
-data/refraction_corrected/
 data/model_formatted/
-
-# SAM3 mask cache
-sam3_mask_generator/mask_cache/
+models/nerfrac_modified/data/
 
 # Model checkpoints & weights
 *.ckpt
@@ -80,6 +73,7 @@ postprocessing/validation/
 postprocessing/validation_lidar/
 postprocessing/pointclouds/
 postprocessing/water_surface/
+postprocessing/refraction/
 
 
 # OS
