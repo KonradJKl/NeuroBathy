@@ -6,14 +6,15 @@ the working directory.
 
 Usage examples:
     # Train
-    python run_nerfrac.py --config configs/pielach.txt
+    python run_nerfrac.py --config configs/pielach_oblique.txt
 
     # Render every view into logs/<experiment>/renderonly_all_<iteration>/
-    python run_nerfrac.py --config configs/pielach.txt --render_only --render_all
+    python run_nerfrac.py --config configs/pielach_oblique.txt \\
+        --render_only --render_all
 
     # Render the test views with a specific checkpoint
-    python run_nerfrac.py --config configs/pielach.txt --render_only --render_test \\
-        --ft_path logs/<experiment>/200000.tar
+    python run_nerfrac.py --config configs/pielach_oblique.txt \\
+        --render_only --render_test --ft_path logs/<experiment>/950000.tar
 """
 
 import math
@@ -815,7 +816,8 @@ def config_parser():
         "--yita",
         type=float,
         default=1.0,
-        help="refractive index of the water (1.333 in the configs)",
+        help="refractive index of the water (1.333 for Pielach, 1.33 in "
+        "configs/real_*.txt)",
     )
 
     parser.add_argument(

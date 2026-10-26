@@ -1,0 +1,35 @@
+expname = pielach_oblique
+basedir = ./logs
+datadir = ../../data/model_formatted/nerfrac/pielach_oblique
+dataset_type = llff
+
+nerf_type = nerfrac
+
+initdepth = -0.4
+yita = 1.333
+water = 1
+
+
+i_video = 1000000
+i_weights = 25000
+tframe = 4
+
+omultires = 0
+refracvmultires = 0
+factor = 8
+
+N_iter = 950000
+N_rand = 4096
+N_samples = 256
+N_importance = 256
+lrate_decay = 250
+
+use_viewdirs = True
+raw_noise_std = 1e0
+
+consistency_weight = 0.1
+N_consist = 256
+distortion_weight = 0.01
+
+render_only = 0
+render_test = 0

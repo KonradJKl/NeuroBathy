@@ -3,7 +3,8 @@
 This folder is a modified copy of
 [NeRFrac: Neural Radiance Fields through Refractive Surface](https://github.com/Yifever20002/NeRFrac)
 (Zhan, Nobuhara, Nishino, Zheng, ICCV 2023), based on upstream commit `5e2e848`.
-The rendering core and the data loaders come from NeRF / nerf-pytorch through NeRFrac.
+The rendering core and the LLFF loader (`load_llff.py`) come from NeRF /
+nerf-pytorch through NeRFrac.
 
 Changes made for shallow-water bathymetry from drone imagery:
 
@@ -33,10 +34,13 @@ Changes made for shallow-water bathymetry from drone imagery:
 - Fixed squeeze dimensions for chunks that contain a single water ray.
 - SSIM computed with OpenCV instead of scikit-image (`utils.py`).
 
-The original README, demo scenes and synthetic configs are in the upstream
-repository. The upstream configs set `llffhold` and `check_weight`, which this
-copy no longer accepts, so delete those two lines before using them. Please
-cite NeRFrac if you use this code:
+`configs/real_*.txt` are upstream's configs for its real scenes, without the
+`llffhold` and `check_weight` lines that this copy no longer accepts; delete the
+same two lines from the other upstream configs. `configs/pielach_oblique.txt` has
+the settings of the best model of my thesis, for the 9 oblique Pielach images and
+the poses in `data/poses/`. Set `--smooth_weight 0` and `--grad_clip 0` to train
+closer to upstream. The original README and the demo scenes are in the upstream
+repository. Please cite NeRFrac if you use this code:
 
 ```
 @inproceedings{zhan2023nerfrac,
