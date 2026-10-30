@@ -216,6 +216,7 @@ main > section > .wide {
 }
 
 .viewer-stage > p,
+.viewer-top,
 .viewer-legend,
 .viewer-tooltip {
   position: absolute;
@@ -230,19 +231,33 @@ main > section > .wide {
   background: rgba(17, 21, 27, 0.78);
 }
 
-.viewer-status {
+/* The model switch with the status line below it on the left, the hint on the right */
+.viewer-top {
   top: 12px;
+  right: 12px;
   left: 12px;
-  padding: 5px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
   pointer-events: none;
 }
 
+.viewer-corner {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}
+
+.viewer-status {
+  margin: 0;
+  padding: 5px 10px;
+}
+
 .viewer-hint {
-  top: 12px;
-  right: 12px;
+  margin: 0 0 0 auto;
   padding: 5px 10px;
   color: var(--on-dark-muted);
-  pointer-events: none;
 }
 
 .viewer-legend {
@@ -346,14 +361,16 @@ main > section > .wide {
   font-size: 0.9rem;
 }
 
-.viewer-controls button {
+.viewer-controls button,
+.viewer-models button {
   min-height: 34px;
   color: inherit;
   font: inherit;
   cursor: pointer;
 }
 
-.viewer-controls :focus-visible {
+.viewer-controls :focus-visible,
+.viewer-models :focus-visible {
   outline: 2px solid #fde725;
   outline-offset: 2px;
 }
@@ -376,6 +393,11 @@ main > section > .wide {
 .segmented button[aria-pressed="true"] {
   background: var(--on-dark);
   color: var(--stage);
+}
+
+.viewer-models {
+  background: rgba(17, 21, 27, 0.78);
+  pointer-events: auto;
 }
 
 .switch {
@@ -627,8 +649,7 @@ tbody tr.split td {
     min-width: 560px;
   }
 
-  .viewer-attribution,
-  .viewer-status:not([hidden]) ~ .viewer-hint {
+  .viewer-attribution {
     display: none;
   }
 }

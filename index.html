@@ -26,6 +26,7 @@
       const message = document.getElementById('viewer-message');
       message.textContent = 'Could not load the 3D viewer.';
       message.hidden = false;
+      document.getElementById('viewer-models').hidden = true;
       document.getElementById('viewer-controls').hidden = true;
     }
   </script>
@@ -52,8 +53,16 @@
     <section class="teaser" aria-label="3D view">
       <div class="viewer wide">
         <div class="viewer-stage" id="viewer-stage">
-          <p class="viewer-status" id="viewer-status" role="status" hidden></p>
-          <p class="viewer-hint" id="viewer-hint" hidden></p>
+          <div class="viewer-top">
+            <div class="viewer-corner">
+              <div class="segmented viewer-models" id="viewer-models" role="group" aria-label="Model">
+                <button type="button" data-model="oblique9" aria-pressed="true">9 oblique images (best&nbsp;model)</button>
+                <button type="button" data-model="all280" aria-pressed="false">280 images (wider&nbsp;area)</button>
+              </div>
+              <p class="viewer-status" id="viewer-status" role="status" hidden></p>
+            </div>
+            <p class="viewer-hint" id="viewer-hint" hidden></p>
+          </div>
           <div class="viewer-legend" id="viewer-legend" hidden></div>
           <p class="viewer-attribution" id="viewer-attribution" hidden></p>
           <div class="viewer-tooltip" id="viewer-tooltip" hidden></div>
@@ -64,6 +73,8 @@
           <div class="segmented" role="group" aria-label="Colouring">
             <button type="button" data-colouring="rgb" aria-pressed="true">True colour</button>
             <button type="button" data-colouring="depth" aria-pressed="false">Depth</button>
+            <button type="button" data-colouring="lidar" aria-pressed="false">LiDAR</button>
+            <button type="button" data-colouring="error" aria-pressed="false">Error</button>
           </div>
           <button type="button" class="switch" id="viewer-survey" aria-pressed="true">Survey points</button>
           <label class="slider">
@@ -74,7 +85,7 @@
           <button type="button" class="reset" id="viewer-reset">Reset view</button>
         </div>
       </div>
-      <p class="caption wide">Point cloud of the best NeRFrac model (9 oblique images, distortion loss, 256 samples) with the 138 survey points. At 1× the view is true to scale, and the riverbed, at most about 2 m deep in a scene 250 m across, looks almost flat. The depth exaggeration stretches only the depth below the water surface, to make its shape visible.</p>
+      <p class="caption wide">Two NeRFrac models, both with distortion loss and 256 samples: the best model, trained on 9 oblique images, and a model trained on all 280 images within 50 m of a centre point, whose point cloud covers a wider area. True colour shows the model's point cloud, Depth its riverbed on the 0.1 m grid used for the evaluation, LiDAR the riverbed of the bathymetric LiDAR in the same colours, and Error the model's depth minus the LiDAR depth on that grid. Except in LiDAR, the 138 survey points are coloured by predicted minus surveyed depth. At 1× the view is true to scale and the riverbed looks almost flat. The depth exaggeration stretches only the depth below the water surface, to make its shape visible.</p>
     </section>
 
     <section id="overview">
@@ -185,7 +196,7 @@ flowchart TD
       <ul class="credits">
         <li><a href="https://github.com/Yifever20002/NeRFrac">NeRFrac</a> by Yifan Zhan, Shohei Nobuhara, Ko Nishino and Yinqiang Zheng (ICCV 2023). It builds on <a href="https://github.com/bmild/nerf">NeRF</a> and <a href="https://github.com/yenchenlin/nerf-pytorch">nerf-pytorch</a>. The repository contains a modified copy.</li>
         <li><a href="https://github.com/facebookresearch/vggt">VGGT</a> (Wang et al., CVPR 2025, University of Oxford and Meta AI) and <a href="https://github.com/facebookresearch/sam3">SAM 3</a> (Carion et al., 2025, Meta) are installed separately and come with their own licenses.</li>
-        <li><a href="https://doi.org/10.48436/taz19-r6618">Pielach River research dataset October 2024</a> by G. Mandlburger, TU Wien, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>. It is described in <a href="https://doi.org/10.23784/HN130-06">Mandlburger et al. (2025)</a>. The point cloud, the survey points and the two maps on this page are derived from it (reconstructed, thinned, re-plotted) and are licensed CC BY 4.0.</li>
+        <li><a href="https://doi.org/10.48436/taz19-r6618">Pielach River research dataset October 2024</a> by G. Mandlburger, TU Wien, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>. It is described in <a href="https://doi.org/10.23784/HN130-06">Mandlburger et al. (2025)</a>. The point clouds, the depth grids with their errors against the LiDAR, the survey points and the two maps on this page are derived from it (reconstructed, thinned, re-plotted) and are licensed CC BY 4.0. The LiDAR riverbed of the 3D view is made from the river bottom points of the dataset's classified LiDAR point cloud, gridded to 0.1 m cells with the median elevation of their points, and is licensed CC BY 4.0 as well.</li>
         <li>The thesis was supervised by Prof. Dr. Begüm Demir and advised by Dr.-Ing. Panagiotis Agrafiotis.</li>
         <li>The code is MIT licensed, see <a href="https://github.com/KonradJKl/NeuroBathy/blob/main/LICENSE">LICENSE</a>. Third-party code keeps its own license, see <a href="https://github.com/KonradJKl/NeuroBathy/blob/main/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>.</li>
         <li>This page uses <a href="https://threejs.org/">three.js</a> and <a href="https://mermaid.js.org/">mermaid</a>, both MIT licensed and loaded from jsDelivr. Its own code is MIT licensed as well.</li>

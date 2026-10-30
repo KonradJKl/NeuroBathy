@@ -1,23 +1,95 @@
 {
   "crs": "EPSG:25833",
-  "origin": [
-    527570.6598535677,
-    5340203.832637745,
-    251.2736232933133
-  ],
-  "step": 0.004,
-  "levels": [
+  "depth_max": 2.0,
+  "models": [
     {
-      "file": "scene_0.bin",
-      "count": 382067
+      "id": "oblique9",
+      "label": "9 oblique images",
+      "home": "river",
+      "origin": [
+        527570.6598535677,
+        5340203.832637745,
+        251.2736232933133
+      ],
+      "step": 0.004,
+      "levels": [
+        {
+          "file": "scene_0.bin",
+          "count": 382067
+        },
+        {
+          "file": "scene_1.bin",
+          "count": 1670108
+        }
+      ],
+      "replaced": "oblique9_replaced.bin",
+      "grid": {
+        "file": "oblique9_grid.bin",
+        "count": 203891,
+        "origin": [
+          527599.8,
+          5340254.4087,
+          255.3844
+        ],
+        "step": 0.002,
+        "cell_size": 0.1
+      },
+      "error": {
+        "file": "oblique9_error.bin",
+        "rmse": 0.47892921059887905
+      },
+      "survey": "survey_points.json"
     },
     {
-      "file": "scene_1.bin",
-      "count": 1670108
+      "id": "all280",
+      "label": "280 nadir and oblique images",
+      "home": "cloud",
+      "origin": [
+        527566.1473578261,
+        5340170.827304438,
+        242.6370811386198
+      ],
+      "step": 0.006,
+      "levels": [
+        {
+          "file": "all280_scene_0.bin",
+          "count": 419167
+        },
+        {
+          "file": "all280_scene_1.bin",
+          "count": 1869118
+        }
+      ],
+      "replaced": "all280_replaced.bin",
+      "grid": {
+        "file": "all280_grid.bin",
+        "count": 291866,
+        "origin": [
+          527599.8,
+          5340249.8204,
+          254.3287
+        ],
+        "step": 0.002,
+        "cell_size": 0.1
+      },
+      "error": {
+        "file": "all280_error.bin",
+        "rmse": 0.48959704208756916
+      },
+      "survey": "all280_survey_points.json"
     }
   ],
-  "depth_max": 2.0,
-  "survey": "survey_points.json",
+  "lidar": {
+    "file": "lidar_bed.bin",
+    "count": 252488,
+    "origin": [
+      527605.05,
+      5340245.05,
+      257.248
+    ],
+    "step": 0.002,
+    "cell_size": 0.1
+  },
   "attribution": "Derived from the Pielach River research dataset October 2024 by G. Mandlburger, TU Wien, licensed CC BY 4.0, https://doi.org/10.48436/taz19-r6618",
   "license": "CC BY 4.0"
 }
